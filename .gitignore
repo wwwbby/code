@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+*.pt
+*.zip
+.venv/
+mini_sample/
+
