@@ -20,9 +20,12 @@ For every 64-value HiF4 block, the implementation:
    micro-scale choices;
 5. rounds and clamps the 64 leaves to legal S1P2 values.
 
-Attention calibration also computes a conservative, exactly cancelling Q/K
-global rescale. A 5% dead band keeps the identity transform when calibration
-only suggests a tiny and potentially noisy change.
+Before quantization, Linear inputs and weights receive the same deterministic
+signed H4 rotation inside each four-value level-3 group. Q and K receive the
+same signed H8 rotation per attention head inside each eight-value level-2
+group. These transforms are orthogonal, so they preserve the unquantized
+Linear output and Q/K logits while spreading local outliers. V is not rotated
+because the public interface has no post-attention inverse-transform hook.
 
 The submission code performs no file I/O and never computes the prohibited
 Linear `A @ W` calibration target.
@@ -31,13 +34,14 @@ Linear `A @ W` calibration target.
 
 Using the synthetic benchmark committed here:
 
-- Linear score mean: `0.094946`
-- Attention score mean: `0.074015`
-- Combined score sum: `0.844805`
-- Combined score mean: `0.084480`
+- Linear score mean: `0.465697`
+- Attention score mean: `0.412388`
+- Combined score sum: `4.390427`
+- Combined score mean: `0.439043`
 
-The provided `self_check.py` passed all `22/22` interface, state, shape, E6M2,
-micro-scale, sign, and mantissa checks on contract-compatible synthetic data.
+The rotation states contain only CPU tensors and primitive values, and the
+generated output shapes and HiF4 values pass the local contract checks. Run the
+organizer's `self_check.py` against the official mini sample before submission.
 
 CPU stress test on the development machine:
 

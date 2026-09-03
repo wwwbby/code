@@ -86,6 +86,70 @@ _E6M2_VALUES = _build_e6m2_values()
 _E6M2_TABLE_CPU = torch.tensor(_E6M2_VALUES, dtype=torch.float32)
 
 
+def _deterministic_signs(length: int, seed: int) -> torch.Tensor:
+    """Build a reproducible CPU Rademacher vector without touching global RNG."""
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    signs = torch.randint(
+        0,
+        2,
+        (length,),
+        generator=generator,
+        dtype=torch.int8,
+    )
+    return signs.to(torch.float32).mul_(2.0).sub_(1.0)
+
+
+def _apply_hadamard_rotation(
+    x: torch.Tensor,
+    signs: torch.Tensor,
+    block_size: int,
+) -> torch.Tensor:
+    """Apply the block-diagonal orthogonal transform D @ H to the last axis.
+
+    Small blocks intentionally align with the HiF4 micro-scale tree: H4 stays
+    inside one level-3 group and H8 stays inside one level-2 group.  Applying
+    the same transform to both sides of a matmul leaves the FP32 result intact.
+    """
+    shape = tuple(int(v) for v in x.shape)
+    channels = int(shape[-1])
+    if block_size <= 0 or block_size & (block_size - 1):
+        raise ValueError(f"Hadamard block size must be a power of two, got {block_size}")
+    if channels % block_size != 0:
+        raise ValueError(
+            f"last dimension {channels} is not divisible by rotation block {block_size}"
+        )
+    if signs.numel() != channels:
+        raise ValueError(
+            f"rotation has {signs.numel()} signs, expected {channels}"
+        )
+
+    blocks = x.to(torch.float32).reshape(-1, channels // block_size, block_size)
+    blocks = blocks * signs.to(device=blocks.device, dtype=torch.float32).reshape(
+        1, channels // block_size, block_size
+    )
+
+    stride = 1
+    while stride < block_size:
+        pairs = blocks.reshape(
+            int(blocks.shape[0]),
+            int(blocks.shape[1]),
+            block_size // (2 * stride),
+            2,
+            stride,
+        )
+        left = pairs[..., 0, :]
+        right = pairs[..., 1, :]
+        blocks = torch.cat((left + right, left - right), dim=-1).reshape(
+            int(blocks.shape[0]),
+            int(blocks.shape[1]),
+            block_size,
+        )
+        stride *= 2
+
+    blocks = blocks * (block_size ** -0.5)
+    return blocks.reshape(shape)
+
+
 def _e6m2_table(device: torch.device) -> torch.Tensor:
     if device.type == "cpu":
         return _E6M2_TABLE_CPU
@@ -465,11 +529,19 @@ def hif4_calibration_and_quantize_weight(
         本函数必须自行实现 Weight 的 HiF4 量化算法。
         本模板不提供 HiF4 参考实现。
     """
-    del calib_activation_list
     weight = dequantize_nvfp4(weight_quant, weight_scale).to(torch.float32)
+    # R = D @ H4 is orthogonal.  Quantizing W @ R offline and A @ R online
+    # preserves A @ W.T before quantization while spreading four-value outliers
+    # within exactly one HiF4 level-3 group.
+    rotation_signs = _deterministic_signs(int(weight.shape[-1]), seed=20260903)
+    rotated_weight = _apply_hadamard_rotation(weight, rotation_signs, block_size=4)
+    del calib_activation_list
     return {
-        "weight_params": _quantize_hif4_search(weight, radius=2),
-        "activation_state": None,
+        "weight_params": _quantize_hif4_search(rotated_weight, radius=2),
+        "activation_state": {
+            "rotation_block": 4,
+            "rotation_signs": rotation_signs,
+        },
     }
 
 
@@ -508,7 +580,12 @@ def hif4_dynamic_quantize_activation(
         activation_quant,
         activation_scale,
     ).to(torch.float32)
-    del activation_state
+    if isinstance(activation_state, dict) and "rotation_signs" in activation_state:
+        activation = _apply_hadamard_rotation(
+            activation,
+            activation_state["rotation_signs"],
+            int(activation_state.get("rotation_block", 4)),
+        )
     return _quantize_hif4_search(activation, radius=2)
 
 
@@ -578,15 +655,33 @@ def hif4_calibration_attention(
             - importance
             - 其他动态量化需要使用的 calibration 结果
     """
-    q_scale, k_scale = _attention_pair_scales(
-        calib_qkv_list,
-        q_num_heads,
-        kv_num_heads,
-        head_dim,
+    if kv_num_heads <= 0 or q_num_heads <= 0 or q_num_heads % kv_num_heads != 0:
+        raise ValueError(
+            f"q_num_heads {q_num_heads} is not divisible by kv_num_heads {kv_num_heads}"
+        )
+    # H8 mixes the two four-value level-3 children under one level-2 scale.
+    # Use the same rotation for each KV head and every Q head mapped to it, so
+    # the pre-quantization Q @ K.T logits remain unchanged.
+    rotation_block = next(
+        (candidate for candidate in (8, 4, 2) if head_dim % candidate == 0),
+        1,
     )
+    k_signs = _deterministic_signs(kv_num_heads * head_dim, seed=424242).reshape(
+        kv_num_heads, head_dim
+    )
+    q_per_kv = q_num_heads // kv_num_heads
+    q_signs = k_signs.repeat_interleave(q_per_kv, dim=0).reshape(-1).contiguous()
+    k_signs = k_signs.reshape(-1).contiguous()
+    del calib_qkv_list
     return {
-        "q_state": {"pair_scale": q_scale},
-        "k_state": {"pair_scale": k_scale},
+        "q_state": {
+            "rotation_block": rotation_block,
+            "rotation_signs": q_signs,
+        },
+        "k_state": {
+            "rotation_block": rotation_block,
+            "rotation_signs": k_signs,
+        },
         "v_state": None,
     }
 
@@ -633,6 +728,12 @@ def hif4_dynamic_quantize_q(
             dtype=torch.float32,
         )
         q = q / pair_scale
+    if isinstance(q_state, dict) and "rotation_signs" in q_state:
+        q = _apply_hadamard_rotation(
+            q,
+            q_state["rotation_signs"],
+            int(q_state.get("rotation_block", 8)),
+        )
     return _quantize_hif4_search(q, radius=2)
 
 
@@ -678,6 +779,12 @@ def hif4_dynamic_quantize_k(
             dtype=torch.float32,
         )
         k = k * pair_scale
+    if isinstance(k_state, dict) and "rotation_signs" in k_state:
+        k = _apply_hadamard_rotation(
+            k,
+            k_state["rotation_signs"],
+            int(k_state.get("rotation_block", 8)),
+        )
     return _quantize_hif4_search(k, radius=2)
 
 
