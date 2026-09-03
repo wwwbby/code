@@ -38,7 +38,7 @@ _HIF4_MAX_MANTISSA = 1.75
 _HIF4_MAX_VALUE = _HIF4_MAX_SCALE * _HIF4_MAX_LOCAL_SCALE * _HIF4_MAX_MANTISSA
 _HIF4_BLOCK_SIZE = 64
 _NVFP4_BLOCK_SIZE = 16
-_SEARCH_CHUNK_BLOCKS = 1024
+_SEARCH_CHUNK_BLOCKS = 4096
 _LINEAR_SMOOTH_ALPHA = 0.65
 _ATTENTION_SMOOTH_ALPHA = 0.25
 _SMOOTH_SCALE_MIN = 1.0 / 16.0
@@ -222,10 +222,194 @@ def _evaluate_hif4_scale_candidates(
     return local_error.sum(dim=-1), local_choice
 
 
-def _quantize_hif4(
+def _fast_candidate_loss(
+    abs_block: torch.Tensor,
+    candidates: torch.Tensor,
+    weight_block: torch.Tensor | None,
+    local_totals: torch.Tensor,
+) -> torch.Tensor:
+    divisor = (
+        candidates[:, :, None, None, None, None]
+        * local_totals[None, None, None, None, None, :]
+    )
+    values = abs_block[:, None, :, :, :, None]
+    mantissa = (torch.round(values / divisor * 4.0) * 0.25).clamp(
+        min=0.0,
+        max=_HIF4_MAX_MANTISSA,
+    )
+    error = (values - mantissa * divisor).square()
+    if weight_block is not None:
+        error = error * weight_block[:, None, :, :, :, None]
+    loss = error.sum(dim=-2)
+    lv2_one = loss[..., 0:2].amin(dim=-1).sum(dim=-1)
+    lv2_two = loss[..., 1:3].amin(dim=-1).sum(dim=-1)
+    return torch.minimum(lv2_one, lv2_two).sum(dim=-1)
+
+
+def _quantize_hif4_fast(
     x: torch.Tensor,
     error_weights: torch.Tensor | None = None,
     enable_refinement: bool = False,
+) -> dict[str, torch.Tensor]:
+    """Equivalent 12-candidate search using three effective local scales.
+
+    The eight legal hierarchy choices reduce to total scales 1, 2, and 4 for
+    each four-value leaf group.  Solving those three losses algebraically avoids
+    materializing an extra eight-choice axis while preserving every tie break.
+    """
+    if not isinstance(x, torch.Tensor) or x.ndim < 1:
+        raise TypeError("x must be a non-scalar torch.Tensor")
+    channels = int(x.shape[-1])
+    if channels % _HIF4_BLOCK_SIZE != 0:
+        raise ValueError("last dimension must be divisible by 64")
+
+    x_fp32 = torch.nan_to_num(
+        x.detach().to(torch.float32),
+        nan=0.0,
+        posinf=_HIF4_MAX_VALUE,
+        neginf=-_HIF4_MAX_VALUE,
+    ).clamp(min=-_HIF4_MAX_VALUE, max=_HIF4_MAX_VALUE)
+    original_shape = tuple(int(size) for size in x_fp32.shape)
+    blocks = x_fp32.reshape(-1, 8, 2, 4)
+
+    weight_blocks = None
+    if error_weights is not None:
+        weights = error_weights.detach().to(device=x_fp32.device, dtype=torch.float32)
+        try:
+            weights = torch.broadcast_to(weights, x_fp32.shape)
+        except RuntimeError as exc:
+            raise ValueError("error_weights cannot broadcast to input") from exc
+        if bool((weights < 0.0).any()):
+            raise ValueError("error_weights must be non-negative")
+        weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
+        weights = weights / weights.mean().clamp_min(1.0e-12)
+        weight_blocks = weights.reshape(-1, 8, 2, 4)
+
+    total_blocks = int(blocks.shape[0])
+    device = blocks.device
+    multipliers = torch.tensor(
+        _GLOBAL_SCALE_MULTIPLIERS,
+        dtype=torch.float32,
+        device=device,
+    )
+    local_totals = torch.tensor([1.0, 2.0, 4.0], device=device)
+    outputs: list[list[torch.Tensor]] = [[], [], [], [], []]
+
+    for start in range(0, total_blocks, _SEARCH_CHUNK_BLOCKS):
+        end = min(start + _SEARCH_CHUNK_BLOCKS, total_blocks)
+        block = blocks[start:end]
+        abs_block = block.abs()
+        base_scale = abs_block.amax(dim=(1, 2, 3)) / 7.0
+        candidates = _snap_to_e6m2(base_scale[:, None] * multipliers[None, :])
+
+        chunk_weights = None if weight_blocks is None else weight_blocks[start:end]
+        candidate_loss = _fast_candidate_loss(
+            abs_block,
+            candidates,
+            chunk_weights,
+            local_totals,
+        )
+        best = candidate_loss.argmin(dim=-1)
+        row_index = torch.arange(end - start, device=device)
+        baseline_scale = candidates[row_index, best]
+        baseline_loss = candidate_loss[row_index, best]
+        scale_factor = baseline_scale
+
+        if enable_refinement:
+            refinement = torch.tensor(
+                _REFINEMENT_SCALE_MULTIPLIERS,
+                dtype=torch.float32,
+                device=device,
+            )
+            refined_candidates = _snap_to_e6m2(
+                baseline_scale[:, None] * refinement[None, :]
+            )
+            refined_loss = _fast_candidate_loss(
+                abs_block,
+                refined_candidates,
+                chunk_weights,
+                local_totals,
+            )
+            refined_best = refined_loss.argmin(dim=-1)
+            best_refined_loss = refined_loss[row_index, refined_best]
+            best_refined_scale = refined_candidates[row_index, refined_best]
+            use_refined = best_refined_loss < baseline_loss * (
+                1.0 - _MIN_REFINEMENT_RELATIVE_IMPROVEMENT
+            )
+            scale_factor = torch.where(
+                use_refined,
+                best_refined_scale,
+                baseline_scale,
+            )
+
+        chosen_divisor = (
+            scale_factor[:, None, None, None, None]
+            * local_totals[None, None, None, None, :]
+        )
+        expanded = abs_block[..., None]
+        chosen_mantissa = (
+            torch.round(expanded / chosen_divisor * 4.0) * 0.25
+        ).clamp(min=0.0, max=_HIF4_MAX_MANTISSA)
+        chosen_error = (expanded - chosen_mantissa * chosen_divisor).square()
+        if weight_blocks is not None:
+            chosen_error = chosen_error * weight_blocks[start:end, :, :, :, None]
+        chosen_loss = chosen_error.sum(dim=-2)
+
+        lv2_one = chosen_loss[..., 0:2].amin(dim=-1).sum(dim=-1)
+        lv2_two = chosen_loss[..., 1:3].amin(dim=-1).sum(dim=-1)
+        use_lv2_two = lv2_two < lv2_one
+        scale_lv2 = torch.where(use_lv2_two, 2.0, 1.0)
+        lv3_for_one = torch.where(
+            chosen_loss[..., 1] < chosen_loss[..., 0],
+            2.0,
+            1.0,
+        )
+        lv3_for_two = torch.where(
+            chosen_loss[..., 2] < chosen_loss[..., 1],
+            2.0,
+            1.0,
+        )
+        scale_lv3 = torch.where(
+            use_lv2_two[:, :, None],
+            lv3_for_two,
+            lv3_for_one,
+        )
+        total = (
+            scale_factor[:, None, None, None]
+            * scale_lv2[:, :, None, None]
+            * scale_lv3[:, :, :, None]
+        )
+        final_mantissa = (
+            torch.round(abs_block / total * 4.0) * 0.25
+        ).clamp(min=0.0, max=_HIF4_MAX_MANTISSA)
+        final_sign = torch.where(
+            final_mantissa == 0.0,
+            torch.zeros((), dtype=torch.float32, device=device),
+            torch.sign(block),
+        )
+        outputs[0].append(scale_factor[:, None, None, None])
+        outputs[1].append(scale_lv2[:, :, None, None])
+        outputs[2].append(scale_lv3[:, :, :, None])
+        outputs[3].append(final_sign)
+        outputs[4].append(final_mantissa)
+
+    prefix = original_shape[:-1] + (channels // 64,)
+    scale_factor, scale_lv2, scale_lv3, sign, mant = [
+        torch.cat(parts, dim=0) for parts in outputs
+    ]
+    return {
+        "scale_factor": scale_factor.reshape(prefix + (1, 1, 1)).contiguous(),
+        "scale_lv2": scale_lv2.reshape(prefix + (8, 1, 1)).contiguous(),
+        "scale_lv3": scale_lv3.reshape(prefix + (8, 2, 1)).contiguous(),
+        "sign": sign.reshape(prefix + (8, 2, 4)).contiguous(),
+        "mant": mant.reshape(prefix + (8, 2, 4)).contiguous(),
+    }
+
+
+def _quantize_hif4(
+    x: torch.Tensor,
+    error_weights: torch.Tensor | None = None,
+    enable_refinement: bool = True,
 ) -> dict[str, torch.Tensor]:
     """Quantize FP32 values with guarded two-stage weighted MSE search."""
 
@@ -235,6 +419,7 @@ def _quantize_hif4(
         raise ValueError("x must have at least one dimension")
     if type(enable_refinement) is not bool:
         raise TypeError("enable_refinement must be a bool")
+    return _quantize_hif4_fast(x, error_weights, enable_refinement)
 
     channels = int(x.shape[-1])
     if channels % _HIF4_BLOCK_SIZE != 0:

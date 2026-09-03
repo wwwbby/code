@@ -15,7 +15,7 @@ For every 64-value HiF4 block, the implementation:
 
 1. decodes the NVFP4 carrier in FP32;
 2. starts from the paper-style `max(abs(x)) / 7` E6M2 scale;
-3. searches 12 broad legal scale candidates;
+3. searches 12 broad and 5 guarded refinement scale candidates;
 4. exactly minimizes elementwise squared error over legal level-2 and level-3
    micro-scale choices;
 5. rounds and clamps the 64 leaves to legal S1P2 values.
@@ -44,11 +44,14 @@ On the organizer's public mini sample:
 - Linear output NMSE cases: `0.00029117`, `0.00037048`, `0.00035774`,
   `0.00039941`, `0.00036960` (mean `0.00035768`);
 - mixed causal/full Attention output NMSE: `0.00509731`;
-- full self-check runtime on the development machine: about `31 s`.
+- full self-check runtime on the development machine: about `20 s`.
 
-This fast numerical path matches the public implementation associated with a
-reported score of `21894` and a server runtime around `184 s`. A fresh hidden-set
-submission is still the authoritative result for this repository revision.
+The local-scale solver algebraically reduces eight hierarchy combinations to
+three effective total scales while preserving the original tie breaks. Its
+numerical path matches the public refinement implementation associated with a
+reported score of `22024` and a server runtime around `210 s`, while the local
+kernel is substantially faster. A fresh hidden-set submission is still the
+authoritative result for this repository revision.
 
 ## Run the proxy benchmark
 
