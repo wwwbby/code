@@ -541,6 +541,15 @@ def hif4_calibration_and_quantize_weight(
         seed=_LINEAR_ROTATION_SEED,
     )
     rotated_weight = _apply_hadamard_rotation(weight, rotation_signs, block_size=4)
+    # For activation error e, the diagonal approximation of output SSE is
+    # sum_j ||W[:, j]||^2 * e_j^2.  Keeping these column energies in the state
+    # steers online activation quantization toward output-sensitive channels.
+    activation_importance = (
+        rotated_weight.reshape(-1, int(rotated_weight.shape[-1]))
+        .square()
+        .sum(dim=0)
+        .cpu()
+    )
     del calib_activation_list
     return {
         "weight_params": _quantize_hif4_search(
@@ -550,6 +559,7 @@ def hif4_calibration_and_quantize_weight(
         "activation_state": {
             "rotation_block": 4,
             "rotation_signs": rotation_signs,
+            "importance": activation_importance,
         },
     }
 
@@ -595,7 +605,14 @@ def hif4_dynamic_quantize_activation(
             activation_state["rotation_signs"],
             int(activation_state.get("rotation_block", 4)),
         )
-    return _quantize_hif4_search(activation, radius=_SEARCH_RADIUS)
+    importance = None
+    if isinstance(activation_state, dict) and "importance" in activation_state:
+        importance = activation_state["importance"]
+    return _quantize_hif4_search(
+        activation,
+        radius=_SEARCH_RADIUS,
+        importance=importance,
+    )
 
 
 # =============================================================================
