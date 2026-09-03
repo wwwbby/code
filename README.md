@@ -8,6 +8,10 @@ legal HiF4 parameters for Linear and Attention workloads.
 - `solution.py`: the six public contest APIs and quantization implementation.
 - `local_proxy_benchmark.py`: reproducible synthetic data generator and proxy
   scorer. It compares the demo with the paper-style peak conversion baseline.
+- `real_model_benchmark.py`: captures weights, activations, and Q/K/V tensors
+  from real Qwen layers and evaluates historical revisions on them.
+- `attention_alpha_sweep.py`: checks whether calibration-derived Q/K balance
+  choices generalize across real layers.
 
 ## Algorithm
 
@@ -28,9 +32,12 @@ block's refined global scale fixed and performs one guarded local coordinate
 sweep. Its exact diagonal plus eight leading covariance directions retain most
 of the block-Hessian benefit without the expensive dense 64x64 updates.
 
-Q and K use reciprocal per-channel smoothing with a zero-overhead `0.4375`
-balance, followed by the same signed H64 transform inside every attention
-head. Calibration builds opposite-side covariance sketches: K guides Q and
+Q and K use reciprocal per-channel smoothing followed by the same signed H64
+transform inside every attention head. Balanced Q/K groups retain the public
+`0.4375` exponent; when calibration K RMS exceeds Q RMS by more than 2x, the
+exponent falls to `0.25`. This two-regime rule is computed from two dot products
+inside the existing calibration pass and does not add dynamic candidates.
+Calibration builds opposite-side covariance sketches: K guides Q and
 grouped Q guides K. Rank-8 refinement is accepted only after a conservative
 30% proxy-loss improvement and uses two bounded local sweeps. V stays in its
 original basis and uses attention-probability-weighted channel importance with
@@ -51,7 +58,12 @@ On the organizer's public mini sample:
 - Linear output NMSE cases: `0.00025638`, `0.00031286`, `0.00028422`,
   `0.00031588`, `0.00028812` (mean `0.00029149`);
 - mixed causal/full Attention output NMSE: `0.00461283`;
-- full self-check runtime on the development machine: about `25 s`.
+- full self-check runtime on the development machine: `26.6 s`.
+
+On three captured `Qwen2.5-0.5B` layers, the adaptive Q/K exponent raises the
+mean full-attention improvement over plain HiF4 from `58.16%` to `71.00%` and
+the causal-attention improvement from `57.26%` to `66.67%`. The public tensor
+has K/Q RMS `1.09`, so it keeps `0.4375` and its output remains unchanged.
 
 The local-scale solver algebraically reduces eight hierarchy combinations to
 three effective total scales while preserving the original tie breaks. The

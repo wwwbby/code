@@ -41,9 +41,11 @@ _HIF4_BLOCK_SIZE = 64
 _NVFP4_BLOCK_SIZE = 16
 _SEARCH_CHUNK_BLOCKS = 4096
 _LINEAR_SMOOTH_ALPHA = 0.65
-# A stronger Q/K balance materially reduces attention-logit error on the
-# public calibration/test split while leaving the runtime path unchanged.
+# Balanced Q/K tensors prefer this stronger exponent; strongly K-dominant
+# real-model layers use the lower fallback selected from calibration RMS.
 _ATTENTION_SMOOTH_ALPHA = 0.4375
+_ATTENTION_IMBALANCED_SMOOTH_ALPHA = 0.25
+_ATTENTION_KQ_RMS_RATIO_THRESHOLD = 2.0
 _SMOOTH_SCALE_MIN = 1.0 / 16.0
 _SMOOTH_SCALE_MAX = 16.0
 
@@ -1746,6 +1748,10 @@ def hif4_calibration_attention(
 
     q_abs_max = torch.zeros((q_num_heads, head_dim), dtype=torch.float32)
     k_abs_max = torch.zeros((kv_num_heads, head_dim), dtype=torch.float32)
+    q_square_sum = torch.zeros((), dtype=torch.float32)
+    k_square_sum = torch.zeros((), dtype=torch.float32)
+    q_element_count = 0
+    k_element_count = 0
     v_weighted_energy = torch.zeros((kv_num_heads, head_dim), dtype=torch.float32)
     v_usage_total = torch.zeros((kv_num_heads, 1), dtype=torch.float32)
     for sample in calib_qkv_list:
@@ -1768,6 +1774,12 @@ def hif4_calibration_attention(
             k_abs_max,
             k.reshape(-1, kv_num_heads, head_dim).abs().amax(dim=0).cpu(),
         )
+        q_flat = q.reshape(-1)
+        k_flat = k.reshape(-1)
+        q_square_sum += torch.dot(q_flat, q_flat).cpu()
+        k_square_sum += torch.dot(k_flat, k_flat).cpu()
+        q_element_count += q.numel()
+        k_element_count += k.numel()
         sample_energy, sample_usage = _attention_v_statistics(
             q,
             k,
@@ -1779,6 +1791,15 @@ def hif4_calibration_attention(
         v_weighted_energy += sample_energy.cpu()
         v_usage_total += sample_usage.cpu()
 
+    q_rms = (q_square_sum / max(q_element_count, 1)).sqrt()
+    k_rms = (k_square_sum / max(k_element_count, 1)).sqrt()
+    kq_rms_ratio = float(k_rms / q_rms.clamp_min(1.0e-12))
+    smooth_alpha = (
+        _ATTENTION_IMBALANCED_SMOOTH_ALPHA
+        if kq_rms_ratio > _ATTENTION_KQ_RMS_RATIO_THRESHOLD
+        else _ATTENTION_SMOOTH_ALPHA
+    )
+
     q_per_kv = q_abs_max.reshape(
         kv_num_heads,
         q_num_heads // kv_num_heads,
@@ -1787,7 +1808,7 @@ def hif4_calibration_attention(
     kv_smooth = _smooth_scale(
         q_per_kv,
         k_abs_max,
-        _ATTENTION_SMOOTH_ALPHA,
+        smooth_alpha,
     ).cpu()
     q_smooth = kv_smooth[:, None, :].expand(
         kv_num_heads,
@@ -1864,14 +1885,14 @@ def hif4_calibration_attention(
     q_state.update({
         "smooth_scale": q_smooth,
         "logit_hessian": q_hessian,
-        "smooth_alpha": _ATTENTION_SMOOTH_ALPHA,
+        "smooth_alpha": smooth_alpha,
         "rotation": "per-head-signed-hadamard-64",
     })
     k_state = _make_state("k")
     k_state.update({
         "smooth_scale": kv_smooth.contiguous(),
         "logit_hessian": k_hessian,
-        "smooth_alpha": _ATTENTION_SMOOTH_ALPHA,
+        "smooth_alpha": smooth_alpha,
         "rotation": "per-head-signed-hadamard-64",
     })
     v_state = _make_state("v")

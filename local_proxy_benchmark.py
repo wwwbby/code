@@ -3,8 +3,10 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import subprocess
 import sys
 import time
+import types
 
 import torch
 
@@ -39,6 +41,15 @@ def from_hif4(params: dict[str, torch.Tensor], shape: tuple[int, ...]) -> torch.
 
 def dequant_pair(solution, pair: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
     return solution.dequantize_nvfp4(*pair).to(torch.float32)
+
+
+def standard_quantize(solution, value: torch.Tensor) -> dict[str, torch.Tensor]:
+    """Call the module's plain HiF4 path across historical revisions."""
+    for name in ("_quantize_hif4_direct", "_quantize_hif4_fast", "_quantize_hif4"):
+        function = getattr(solution, name, None)
+        if function is not None:
+            return function(value)
+    raise AttributeError("solution has no plain HiF4 quantizer")
 
 
 def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
@@ -120,14 +131,14 @@ def run(solution, data) -> None:
     )
     player_weight = from_hif4(calibration["weight_params"], tuple(weight.shape))
 
-    std_weight = from_hif4(solution._quantize_hif4_direct(weight), tuple(weight.shape))
+    std_weight = from_hif4(standard_quantize(solution, weight), tuple(weight.shape))
     linear_scores = []
     for pair in linear["test_activation_list"]:
         activation = dequant_pair(solution, pair)
         reference = activation @ weight.T
 
         std_activation = from_hif4(
-            solution._quantize_hif4_direct(activation), tuple(activation.shape)
+            standard_quantize(solution, activation), tuple(activation.shape)
         )
         std_output = std_activation @ std_weight.T
 
@@ -156,9 +167,9 @@ def run(solution, data) -> None:
         v = dequant_pair(solution, sample["v"])
         reference = attention(q, k, v, q_heads, kv_heads, head_dim)
 
-        std_q = from_hif4(solution._quantize_hif4_direct(q), tuple(q.shape))
-        std_k = from_hif4(solution._quantize_hif4_direct(k), tuple(k.shape))
-        std_v = from_hif4(solution._quantize_hif4_direct(v), tuple(v.shape))
+        std_q = from_hif4(standard_quantize(solution, q), tuple(q.shape))
+        std_k = from_hif4(standard_quantize(solution, k), tuple(k.shape))
+        std_v = from_hif4(standard_quantize(solution, v), tuple(v.shape))
         std_output = attention(std_q, std_k, std_v, q_heads, kv_heads, head_dim)
 
         player_q = from_hif4(
@@ -205,12 +216,38 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--solution_dir", default=os.path.dirname(__file__))
     parser.add_argument("--save_datasets_dir")
+    parser.add_argument("--datasets_dir")
+    parser.add_argument("--revision")
     args = parser.parse_args()
 
-    sys.path.insert(0, os.path.abspath(args.solution_dir))
-    import solution
+    if args.revision:
+        source = subprocess.check_output(
+            ["git", "show", f"{args.revision}:solution.py"],
+            cwd=os.path.abspath(args.solution_dir),
+            text=True,
+            encoding="utf-8",
+        )
+        solution = types.ModuleType(f"solution_{args.revision}")
+        exec(compile(source, f"<{args.revision}:solution.py>", "exec"), solution.__dict__)
+    else:
+        sys.path.insert(0, os.path.abspath(args.solution_dir))
+        import solution
 
-    data = make_data()
+    if args.datasets_dir:
+        data = {
+            "linear": torch.load(
+                os.path.join(args.datasets_dir, "linear.pt"),
+                map_location="cpu",
+                weights_only=False,
+            )[0],
+            "attention": torch.load(
+                os.path.join(args.datasets_dir, "attn.pt"),
+                map_location="cpu",
+                weights_only=False,
+            )[0],
+        }
+    else:
+        data = make_data()
     if args.save_datasets_dir:
         save_self_check_data(data, args.save_datasets_dir)
     run(solution, data)

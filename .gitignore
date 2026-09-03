@@ -3,5 +3,8 @@ __pycache__/
 *.pt
 *.zip
 .venv/
+.venv-real/
+.cache/
 mini_sample/
-
+real_models/
+real_model_data/
