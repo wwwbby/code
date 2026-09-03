@@ -56,15 +56,31 @@ def dequantize_nvfp4(
     Returns:
         BF16 Tensor，shape 与 ``quant_float`` 相同。
     """
+    return _dequantize_nvfp4_fp32(quant_float, scale_float, blk_size).to(
+        torch.bfloat16
+    )
+
+
+def _dequantize_nvfp4_fp32(
+    quant_float: torch.Tensor,
+    scale_float: torch.Tensor,
+    blk_size: int = 16,
+) -> torch.Tensor:
+    """Decode the NVFP4 carrier without avoidable intermediate BF16 rounding."""
     channels = int(quant_float.shape[-1])
     if channels % blk_size != 0:
         raise ValueError(
             f"last dimension {channels} is not divisible by block size {blk_size}"
         )
 
-    x = quant_float.unflatten(-1, (-1, blk_size))
-    x = x * scale_float.unsqueeze(-1)
-    return x.flatten(-2, -1).to(torch.bfloat16)
+    expected = tuple(quant_float.shape[:-1]) + (channels // blk_size,)
+    if tuple(scale_float.shape) != expected:
+        raise ValueError(
+            f"scale shape {tuple(scale_float.shape)} does not match {expected}"
+        )
+    x = quant_float.detach().to(torch.float32).unflatten(-1, (-1, blk_size))
+    x = x * scale_float.detach().to(device=x.device, dtype=torch.float32).unsqueeze(-1)
+    return x.flatten(-2, -1)
 
 
 # =============================================================================
@@ -84,22 +100,61 @@ def _build_e6m2_values() -> tuple[float, ...]:
 
 _E6M2_VALUES = _build_e6m2_values()
 _E6M2_TABLE_CPU = torch.tensor(_E6M2_VALUES, dtype=torch.float32)
-_SEARCH_RADIUS = 3
-_LINEAR_ROTATION_SEED = 2
-_ATTENTION_ROTATION_SEED = 7
+_GLOBAL_SCALE_MULTIPLIERS = (
+    0.25,
+    0.35,
+    0.50,
+    0.70,
+    0.85,
+    1.00,
+    1.20,
+    1.50,
+    2.00,
+    2.50,
+    3.00,
+    4.00,
+)
+_REFINEMENT_SCALE_MULTIPLIERS = (0.75, 0.875, 1.0, 1.125, 1.25)
+_MIN_REFINEMENT_IMPROVEMENT = 0.01
+_LINEAR_SMOOTH_ALPHA = 0.65
+_ATTENTION_SMOOTH_ALPHA = 0.25
+_SMOOTH_SCALE_MIN = 1.0 / 16.0
+_SMOOTH_SCALE_MAX = 16.0
+_V_IMPORTANCE_POWER = 0.25
+_V_IMPORTANCE_BLEND = 0.25
+_V_IMPORTANCE_MIN = 0.5
+_V_IMPORTANCE_MAX = 2.0
+_V_MIN_WEIGHTED_IMPROVEMENT = 0.01
+_V_MAX_PLAIN_REGRESSION = 0.0025
+_HESSIAN_DAMPING = 0.01
+_HESSIAN_SWEEP_ROUNDS = 2
+_HESSIAN_CHUNK_BLOCKS = 8192
+_HESSIAN_MIN_IMPROVEMENT = 0.01
 
 
-def _deterministic_signs(length: int, seed: int) -> torch.Tensor:
-    """Build a reproducible CPU Rademacher vector without touching global RNG."""
-    generator = torch.Generator(device="cpu").manual_seed(seed)
-    signs = torch.randint(
-        0,
-        2,
-        (length,),
-        generator=generator,
-        dtype=torch.int8,
+def _block_signs64(channels: int) -> torch.Tensor:
+    """Build stable per-block Rademacher signs for a 64D Hadamard rotation."""
+    if channels % 64 != 0:
+        raise ValueError(f"channels {channels} is not divisible by 64")
+    block = torch.arange(channels // 64, dtype=torch.int64)[:, None]
+    lane = torch.arange(64, dtype=torch.int64)[None, :]
+    hashed = (lane * 1103515245 + block * 12345 + 0x9E3779B9) & 0x7FFFFFFF
+    return torch.where(((hashed >> 16) & 1) == 0, 1.0, -1.0).reshape(-1)
+
+
+def _smooth_scale(
+    left_abs_max: torch.Tensor,
+    right_abs_max: torch.Tensor,
+    alpha: float,
+) -> torch.Tensor:
+    """Return a bounded reciprocal scale that balances two matmul operands."""
+    left = left_abs_max.to(torch.float32).clamp_min(1.0e-6)
+    right = right_abs_max.to(torch.float32).clamp_min(1.0e-6)
+    scale = left.pow(alpha) / right.pow(1.0 - alpha)
+    return torch.nan_to_num(scale, nan=1.0, posinf=1.0, neginf=1.0).clamp(
+        min=_SMOOTH_SCALE_MIN,
+        max=_SMOOTH_SCALE_MAX,
     )
-    return signs.to(torch.float32).mul_(2.0).sub_(1.0)
 
 
 def _apply_hadamard_rotation(
@@ -173,6 +228,25 @@ def _nearest_e6m2_index(
     lo_value = table[lo]
     hi_value = table[hi]
     return torch.where(target - lo_value <= hi_value - target, lo, hi)
+
+
+def _snap_to_e6m2(value: torch.Tensor) -> torch.Tensor:
+    """Round positive FP32 values onto the checker's finite E6M2 grid."""
+    value = torch.nan_to_num(
+        value,
+        nan=float(_E6M2_VALUES[0]),
+        posinf=float(_E6M2_VALUES[-1]),
+        neginf=float(_E6M2_VALUES[0]),
+    ).clamp(min=float(_E6M2_VALUES[0]), max=float(_E6M2_VALUES[-1]))
+    exponent = torch.floor(torch.log2(value))
+    quantum = torch.pow(
+        torch.tensor(2.0, dtype=value.dtype, device=value.device),
+        exponent - 2.0,
+    )
+    return (torch.round(value / quantum) * quantum).clamp(
+        min=float(_E6M2_VALUES[0]),
+        max=float(_E6M2_VALUES[-1]),
+    )
 
 
 def _pack_hif4(
@@ -253,21 +327,12 @@ def _quantize_hif4_direct(x: torch.Tensor) -> dict[str, torch.Tensor]:
     )
 
 
-def _search_chunk(
+def _candidate_loss(
     blocks: torch.Tensor,
-    table: torch.Tensor,
-    radius: int,
-    importance: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Minimize elementwise SSE under the legal two-level micro-scale tree."""
-    peak = blocks.abs().amax(dim=(1, 2, 3))
-    base_index = _nearest_e6m2_index(peak / 7.0, table)
-    offsets = torch.arange(-radius, radius + 1, device=blocks.device)
-    candidate_index = (
-        base_index[:, None] + offsets[None, :]
-    ).clamp_(0, table.numel() - 1)
-    candidates = table[candidate_index]
-
+    candidates: torch.Tensor,
+    importance: torch.Tensor | None,
+) -> torch.Tensor:
+    """Evaluate global scales after exactly optimizing the local scale tree."""
     totals = torch.tensor([1.0, 2.0, 4.0], device=blocks.device)
     divisor = (
         candidates[:, :, None, None, None, None]
@@ -284,10 +349,45 @@ def _search_chunk(
 
     l2_one_cost = loss[..., 0:2].amin(dim=-1).sum(dim=-1)
     l2_two_cost = loss[..., 1:3].amin(dim=-1).sum(dim=-1)
-    candidate_cost = torch.minimum(l2_one_cost, l2_two_cost).sum(dim=-1)
-    best_candidate = candidate_cost.argmin(dim=-1)
-    scale_factor = candidates.gather(1, best_candidate[:, None]).squeeze(1)
+    return torch.minimum(l2_one_cost, l2_two_cost).sum(dim=-1)
 
+
+def _search_chunk(
+    blocks: torch.Tensor,
+    importance: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Minimize weighted SSE with broad and guarded refined E6M2 search."""
+    peak = blocks.abs().amax(dim=(1, 2, 3))
+    multipliers = torch.tensor(
+        _GLOBAL_SCALE_MULTIPLIERS,
+        dtype=torch.float32,
+        device=blocks.device,
+    )
+    candidates = _snap_to_e6m2((peak / 7.0)[:, None] * multipliers[None, :])
+    candidate_cost = _candidate_loss(blocks, candidates, importance)
+    best_candidate = candidate_cost.argmin(dim=-1)
+    row_index = torch.arange(int(blocks.shape[0]), device=blocks.device)
+    baseline_scale = candidates[row_index, best_candidate]
+    baseline_cost = candidate_cost[row_index, best_candidate]
+
+    refinement = torch.tensor(
+        _REFINEMENT_SCALE_MULTIPLIERS,
+        dtype=torch.float32,
+        device=blocks.device,
+    )
+    refined_candidates = _snap_to_e6m2(
+        baseline_scale[:, None] * refinement[None, :]
+    )
+    refined_cost = _candidate_loss(blocks, refined_candidates, importance)
+    best_refined = refined_cost.argmin(dim=-1)
+    refined_scale = refined_candidates[row_index, best_refined]
+    best_refined_cost = refined_cost[row_index, best_refined]
+    use_refined = best_refined_cost < baseline_cost * (
+        1.0 - _MIN_REFINEMENT_IMPROVEMENT
+    )
+    scale_factor = torch.where(use_refined, refined_scale, baseline_scale)
+
+    totals = torch.tensor([1.0, 2.0, 4.0], device=blocks.device)
     chosen_divisor = (
         scale_factor[:, None, None, None, None]
         * totals[None, None, None, None, :]
@@ -324,11 +424,10 @@ def _search_chunk(
 
 def _quantize_hif4_search(
     x: torch.Tensor,
-    radius: int = 2,
-    chunk_blocks: int = 4096,
+    chunk_blocks: int = 1024,
     importance: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Demo quantizer: search nearby E6M2 scales and exact micro-scale choices."""
+    """Search legal global and local scales with an optional weighted loss."""
     original_shape = tuple(int(v) for v in x.shape)
     channels = int(original_shape[-1])
     if channels % 64 != 0:
@@ -340,7 +439,6 @@ def _quantize_hif4_search(
         importance = importance.to(device=blocks.device, dtype=torch.float32)
         importance = torch.broadcast_to(importance, original_shape)
         importance_blocks = importance.reshape(-1, 8, 2, 4)
-    table = _e6m2_table(blocks.device)
     outputs: list[list[torch.Tensor]] = [[], [], [], [], []]
     for start in range(0, int(blocks.shape[0]), chunk_blocks):
         chunk_importance = None
@@ -348,8 +446,6 @@ def _quantize_hif4_search(
             chunk_importance = importance_blocks[start:start + chunk_blocks]
         result = _search_chunk(
             blocks[start:start + chunk_blocks],
-            table,
-            radius,
             chunk_importance,
         )
         for bucket, value in zip(outputs, result):
@@ -410,6 +506,406 @@ def _attention_pair_scales(
     q_scale = pair_scale.repeat_interleave(q_per_kv, dim=0).reshape(-1)
     k_scale = pair_scale.reshape(-1)
     return q_scale.contiguous(), k_scale.contiguous()
+
+
+def _attention_weighted_v_energy(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_num_heads: int,
+    kv_num_heads: int,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Estimate each V channel's contribution under full and causal attention."""
+    q_length = int(q.shape[0])
+    key_length = int(k.shape[0])
+    if q_length <= 256:
+        positions = torch.arange(q_length, device=q.device)
+    else:
+        positions = torch.linspace(
+            0,
+            q_length - 1,
+            steps=256,
+            device=q.device,
+        ).round().to(torch.int64)
+    q_heads = q.reshape(q_length, q_num_heads, head_dim).permute(1, 0, 2)
+    k_heads = k.reshape(key_length, kv_num_heads, head_dim).permute(1, 0, 2)
+    v_energy = v.reshape(key_length, kv_num_heads, head_dim).permute(1, 0, 2).square()
+    key_positions = torch.arange(key_length, device=q.device)
+    q_per_kv = q_num_heads // kv_num_heads
+    energy = torch.zeros((kv_num_heads, head_dim), device=q.device)
+    usage_total = torch.zeros((kv_num_heads, 1), device=q.device)
+
+    for kv_head in range(kv_num_heads):
+        queries = q_heads[kv_head * q_per_kv:(kv_head + 1) * q_per_kv]
+        key = k_heads[kv_head]
+        for start in range(0, int(positions.numel()), 64):
+            selected = positions[start:start + 64]
+            logits = torch.matmul(
+                queries[:, selected].float(),
+                key.float().transpose(0, 1),
+            ) / math.sqrt(float(head_dim))
+            full_usage = torch.softmax(logits, dim=-1).square().sum(dim=(0, 1))
+            if q_length == key_length:
+                causal_limit = selected
+            elif q_length == 1:
+                causal_limit = torch.zeros_like(selected)
+            else:
+                causal_limit = torch.round(
+                    selected.float() * float(key_length - 1) / float(q_length - 1)
+                ).to(torch.int64)
+            mask = key_positions[None, :] <= causal_limit[:, None]
+            causal_usage = torch.softmax(
+                logits.masked_fill(~mask[None], float("-inf")),
+                dim=-1,
+            ).square().sum(dim=(0, 1))
+            usage = 0.5 * (full_usage + causal_usage)
+            energy[kv_head] += (usage[:, None] * v_energy[kv_head]).sum(dim=0)
+            usage_total[kv_head] += usage.sum()
+    return energy, usage_total
+
+
+def _finalize_v_importance(
+    weighted_energy: torch.Tensor,
+    usage_total: torch.Tensor,
+) -> torch.Tensor:
+    relative = weighted_energy / usage_total.clamp_min(1.0e-8)
+    median = relative.median(dim=-1, keepdim=True).values
+    compressed = (relative / (median + 1.0e-8)).clamp_min(0.0).pow(
+        _V_IMPORTANCE_POWER
+    ).clamp(min=_V_IMPORTANCE_MIN, max=_V_IMPORTANCE_MAX)
+    importance = (1.0 - _V_IMPORTANCE_BLEND) + _V_IMPORTANCE_BLEND * compressed
+    importance = torch.nan_to_num(importance, nan=1.0, posinf=1.0, neginf=1.0)
+    blocks = importance.reshape(-1, 64)
+    blocks = blocks / blocks.mean(dim=-1, keepdim=True).clamp_min(1.0e-8)
+    return blocks.reshape_as(importance).cpu().contiguous()
+
+
+def _reconstruct_hif4(
+    params: dict[str, torch.Tensor],
+    reference: torch.Tensor,
+) -> torch.Tensor:
+    return (
+        params["sign"]
+        * params["mant"]
+        * params["scale_lv2"]
+        * params["scale_lv3"]
+        * params["scale_factor"]
+    ).reshape_as(reference)
+
+
+def _local_scale_options(
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Enumerate the eight legal (level-2, left-level-3, right-level-3) choices."""
+    lv2 = torch.tensor(
+        [1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0],
+        device=device,
+    )
+    lv3 = torch.tensor(
+        [
+            [1.0, 1.0],
+            [1.0, 2.0],
+            [2.0, 1.0],
+            [2.0, 2.0],
+            [1.0, 1.0],
+            [1.0, 2.0],
+            [2.0, 1.0],
+            [2.0, 2.0],
+        ],
+        device=device,
+    )
+    return lv2, lv3, lv2[:, None] * lv3
+
+
+def _evaluate_scale_candidates(
+    abs_blocks: torch.Tensor,
+    candidate_scales: torch.Tensor,
+    importance: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return weighted errors and local-scale choices for global candidates."""
+    _, _, local = _local_scale_options(abs_blocks.device)
+    values = abs_blocks[:, None, :, None, :, :]
+    divisors = (
+        candidate_scales[:, :, None, None, None, None]
+        * local[None, None, None, :, :, None]
+    )
+    mant = (torch.round(values / divisors * 4.0) * 0.25).clamp(0.0, 1.75)
+    error = (values - mant * divisors).square()
+    if importance is not None:
+        error = error * importance[:, None, :, None, :, :]
+    error = error.sum(dim=(-1, -2))
+    local_error, local_choice = error.min(dim=-1)
+    return local_error.sum(dim=-1), local_choice
+
+
+def _build_block_hessian(
+    transformed_activations: list[torch.Tensor],
+    channels: int,
+) -> torch.Tensor:
+    """Build a normalized, damped 64D covariance for each input block."""
+    rows = torch.cat(
+        [value.reshape(-1, channels) for value in transformed_activations],
+        dim=0,
+    )
+    block_count = channels // 64
+    stacked = rows.reshape(-1, block_count, 64)
+    hessian = torch.einsum("nbx,nby->bxy", stacked, stacked) / max(
+        int(rows.shape[0]),
+        1,
+    )
+    trace = torch.diagonal(hessian, dim1=-2, dim2=-1).sum(dim=-1)
+    normalization = (trace / 64.0).clamp_min(1.0e-8)
+    eye = torch.eye(64, dtype=torch.float32, device=rows.device)[None]
+    return hessian / normalization[:, None, None] + _HESSIAN_DAMPING * eye
+
+
+def _materialize_block_choice(
+    values: torch.Tensor,
+    global_scale: torch.Tensor,
+    local_choice: torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Decode one selected global/local scale assignment for 64D blocks."""
+    lv2, lv3, local = _local_scale_options(values.device)
+    total = global_scale[:, None, None, None] * local[local_choice][:, :, :, None]
+    blocks = values.reshape(-1, 8, 2, 4)
+    mant = (torch.round(blocks.abs() / total * 4.0) * 0.25).clamp(0.0, 1.75)
+    sign = torch.where(mant == 0.0, 0.0, torch.sign(blocks))
+    reconstructed = (sign * mant * total).reshape(-1, 64)
+    params = {
+        "scale_factor": global_scale[:, None, None, None],
+        "scale_lv2": lv2[local_choice][:, :, None, None],
+        "scale_lv3": lv3[local_choice][:, :, :, None],
+        "sign": sign,
+        "mant": mant,
+    }
+    return reconstructed, params
+
+
+def _group_reconstruction_cache(
+    values: torch.Tensor,
+    global_scale: torch.Tensor,
+) -> list[torch.Tensor]:
+    """Precompute all eight local reconstructions for every 8-value group."""
+    _, _, local = _local_scale_options(values.device)
+    abs_values = values.abs()
+    signs = torch.sign(values)
+    caches: list[torch.Tensor] = []
+    for group in range(8):
+        piece = abs_values[:, group * 8:(group + 1) * 8].reshape(-1, 2, 4)
+        divisor = global_scale[:, None, None, None] * local[None, :, :, None]
+        mant = (torch.round(piece[:, None] / divisor * 4.0) * 0.25).clamp(
+            0.0,
+            1.75,
+        )
+        group_sign = signs[:, group * 8:(group + 1) * 8].reshape(-1, 1, 2, 4)
+        group_sign = torch.where(mant == 0.0, 0.0, group_sign)
+        caches.append((group_sign * mant * divisor).reshape(-1, 8, 8))
+    return caches
+
+
+def _hessian_loss(
+    error: torch.Tensor,
+    hessian: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    hessian_error = torch.bmm(error[:, None, :], hessian).squeeze(1)
+    return (hessian_error * error).sum(dim=-1), hessian_error
+
+
+def _sweep_hessian_local_scales(
+    values: torch.Tensor,
+    global_scale: torch.Tensor,
+    initial_choice: torch.Tensor,
+    hessian: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    """Run deterministic coordinate descent over the eight local scale groups."""
+    choices = initial_choice.clone()
+    reconstructed, _ = _materialize_block_choice(values, global_scale, choices)
+    error = values - reconstructed
+    loss, hessian_error = _hessian_loss(error, hessian)
+    changes = torch.zeros(int(values.shape[0]), dtype=torch.int64, device=values.device)
+    caches = _group_reconstruction_cache(values, global_scale)
+
+    for _ in range(_HESSIAN_SWEEP_ROUNDS):
+        for group in range(8):
+            start = group * 8
+            old_reconstruction = reconstructed[:, start:start + 8]
+            old_error = error[:, start:start + 8]
+            delta = caches[group] - old_reconstruction[:, None, :]
+            diagonal_hessian = hessian[:, start:start + 8, start:start + 8]
+            quadratic = (delta @ diagonal_hessian.transpose(-1, -2) * delta).sum(
+                dim=-1
+            )
+            linear = 2.0 * (
+                delta * hessian_error[:, None, start:start + 8]
+            ).sum(dim=-1)
+            delta_loss = quadratic - linear
+            best_choice = delta_loss.argmin(dim=-1)
+            best_delta_loss = delta_loss.gather(1, best_choice[:, None]).squeeze(1)
+            chosen = torch.where(
+                best_delta_loss < 0.0,
+                best_choice,
+                choices[:, group],
+            )
+            changed = chosen != choices[:, group]
+            changes += changed.to(torch.int64)
+            chosen_delta = delta.gather(
+                1,
+                chosen[:, None, None].expand(-1, 1, 8),
+            ).squeeze(1)
+            if bool(changed.any()):
+                reconstructed[changed, start:start + 8] = caches[group][
+                    changed,
+                    chosen[changed],
+                ]
+                error[changed, start:start + 8] = (
+                    old_error[changed] - chosen_delta[changed]
+                )
+                hessian_error -= torch.bmm(
+                    hessian[:, :, start:start + 8],
+                    chosen_delta[:, :, None],
+                ).squeeze(-1)
+                loss = loss + torch.where(
+                    changed,
+                    best_delta_loss,
+                    torch.zeros((), device=values.device),
+                )
+            choices[:, group] = chosen
+
+    reconstructed, params = _materialize_block_choice(values, global_scale, choices)
+    loss, _ = _hessian_loss(values - reconstructed, hessian)
+    return loss, changes, params
+
+
+def _select_hessian_winner(
+    current: tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]] | None,
+    loss: torch.Tensor,
+    changes: torch.Tensor,
+    scale: torch.Tensor,
+    params: dict[str, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    """Select deterministically by loss, edit count, then smaller global scale."""
+    if current is None:
+        return loss, changes, scale, params
+    old_loss, old_changes, old_scale, old_params = current
+    better = (
+        (loss < old_loss)
+        | ((loss == old_loss) & (changes < old_changes))
+        | ((loss == old_loss) & (changes == old_changes) & (scale < old_scale))
+    )
+    condition = better[:, None, None, None]
+    selected_params = {
+        key: torch.where(condition, params[key], old_params[key])
+        for key in old_params
+    }
+    return (
+        torch.where(better, loss, old_loss),
+        torch.where(better, changes, old_changes),
+        torch.where(better, scale, old_scale),
+        selected_params,
+    )
+
+
+def _quantize_weight_with_block_hessian(
+    weight: torch.Tensor,
+    activation_second: torch.Tensor,
+    hessian_by_input_block: torch.Tensor,
+    baseline: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Improve Linear weight blocks under their calibration-output Hessian."""
+    rows, channels = weight.shape
+    block_count = channels // 64
+    values = weight.reshape(rows, block_count, 64).reshape(-1, 64)
+    block_index = torch.arange(int(values.shape[0]), device=weight.device) % block_count
+    importance = activation_second.reshape(block_count, 64)
+    flat_baseline = {
+        key: tensor.reshape(rows * block_count, *tensor.shape[2:])
+        for key, tensor in baseline.items()
+    }
+    baseline_values = (
+        flat_baseline["sign"]
+        * flat_baseline["mant"]
+        * flat_baseline["scale_lv2"]
+        * flat_baseline["scale_lv3"]
+        * flat_baseline["scale_factor"]
+    ).reshape(-1, 64)
+    output = {key: torch.empty_like(value) for key, value in flat_baseline.items()}
+    coarse = torch.tensor(_GLOBAL_SCALE_MULTIPLIERS, device=weight.device)
+    refine = torch.tensor(_REFINEMENT_SCALE_MULTIPLIERS, device=weight.device)
+
+    for start in range(0, int(values.shape[0]), _HESSIAN_CHUNK_BLOCKS):
+        end = min(start + _HESSIAN_CHUNK_BLOCKS, int(values.shape[0]))
+        batch = values[start:end]
+        batch_hessian = hessian_by_input_block[block_index[start:end]]
+        baseline_loss, _ = _hessian_loss(
+            batch - baseline_values[start:end],
+            batch_hessian,
+        )
+        batch_importance = importance[block_index[start:end]].reshape(-1, 8, 2, 4)
+        peak_scale = batch.abs().amax(dim=-1) / 7.0
+        candidate_scales = _snap_to_e6m2(peak_scale[:, None] * coarse[None])
+        _, initial_choices = _evaluate_scale_candidates(
+            batch.abs().reshape(-1, 8, 2, 4),
+            candidate_scales,
+            batch_importance,
+        )
+        winner = None
+        for candidate in range(len(_GLOBAL_SCALE_MULTIPLIERS)):
+            scale = candidate_scales[:, candidate]
+            result_loss, changes, params = _sweep_hessian_local_scales(
+                batch,
+                scale,
+                initial_choices[:, candidate],
+                batch_hessian,
+            )
+            winner = _select_hessian_winner(
+                winner,
+                result_loss,
+                changes,
+                scale,
+                params,
+            )
+
+        assert winner is not None
+        winner_scale = winner[2]
+        refined_scales = _snap_to_e6m2(winner_scale[:, None] * refine[None])
+        _, refined_choices = _evaluate_scale_candidates(
+            batch.abs().reshape(-1, 8, 2, 4),
+            refined_scales,
+            batch_importance,
+        )
+        refined_winner = None
+        for candidate in range(len(_REFINEMENT_SCALE_MULTIPLIERS)):
+            scale = refined_scales[:, candidate]
+            result_loss, changes, params = _sweep_hessian_local_scales(
+                batch,
+                scale,
+                refined_choices[:, candidate],
+                batch_hessian,
+            )
+            refined_winner = _select_hessian_winner(
+                refined_winner,
+                result_loss,
+                changes,
+                scale,
+                params,
+            )
+
+        assert refined_winner is not None
+        improved_loss, _, _, improved_params = refined_winner
+        use_improved = improved_loss < baseline_loss * (1.0 - _HESSIAN_MIN_IMPROVEMENT)
+        condition = use_improved[:, None, None, None]
+        for key in output:
+            output[key][start:end] = torch.where(
+                condition,
+                improved_params[key],
+                flat_baseline[key][start:end],
+            )
+
+    return {
+        key: value.reshape(rows, block_count, *value.shape[1:]).contiguous()
+        for key, value in output.items()
+    }
 
 
 # =============================================================================
@@ -532,34 +1028,74 @@ def hif4_calibration_and_quantize_weight(
         本函数必须自行实现 Weight 的 HiF4 量化算法。
         本模板不提供 HiF4 参考实现。
     """
-    weight = dequantize_nvfp4(weight_quant, weight_scale).to(torch.float32)
-    # R = D @ H4 is orthogonal.  Quantizing W @ R offline and A @ R online
-    # preserves A @ W.T before quantization while spreading four-value outliers
-    # within exactly one HiF4 level-3 group.
-    rotation_signs = _deterministic_signs(
-        int(weight.shape[-1]),
-        seed=_LINEAR_ROTATION_SEED,
+    weight = _dequantize_nvfp4_fp32(weight_quant, weight_scale)
+    channels = int(weight.shape[-1])
+    if not calib_activation_list:
+        raise ValueError("calib_activation_list must not be empty")
+
+    activation_abs_max = torch.zeros(
+        channels,
+        dtype=torch.float32,
+        device=weight.device,
     )
-    rotated_weight = _apply_hadamard_rotation(weight, rotation_signs, block_size=4)
-    # For activation error e, the diagonal approximation of output SSE is
-    # sum_j ||W[:, j]||^2 * e_j^2.  Keeping these column energies in the state
-    # steers online activation quantization toward output-sensitive channels.
-    activation_importance = (
-        rotated_weight.reshape(-1, int(rotated_weight.shape[-1]))
-        .square()
-        .sum(dim=0)
-        .cpu()
+    decoded_activations: list[torch.Tensor] = []
+    for quant, scale in calib_activation_list:
+        activation = _dequantize_nvfp4_fp32(quant, scale)
+        decoded_activations.append(activation)
+        activation_abs_max = torch.maximum(
+            activation_abs_max,
+            activation.abs().reshape(-1, channels).amax(dim=0),
+        )
+
+    smooth = _smooth_scale(
+        activation_abs_max,
+        weight.abs().amax(dim=0),
+        _LINEAR_SMOOTH_ALPHA,
     )
-    del calib_activation_list
+    rotation_signs = _block_signs64(channels)
+    transformed_weight = _apply_hadamard_rotation(
+        weight * smooth,
+        rotation_signs,
+        block_size=64,
+    )
+
+    activation_second = torch.zeros(
+        channels,
+        dtype=torch.float32,
+        device=weight.device,
+    )
+    activation_count = 0
+    transformed_activations: list[torch.Tensor] = []
+    for activation in decoded_activations:
+        transformed = _apply_hadamard_rotation(
+            activation / smooth,
+            rotation_signs,
+            block_size=64,
+        )
+        transformed_activations.append(transformed)
+        activation_second += transformed.reshape(-1, channels).square().sum(dim=0)
+        activation_count += transformed.numel() // channels
+    activation_second = (activation_second / max(activation_count, 1)).clamp_min(
+        1.0e-8
+    )
+    activation_importance = transformed_weight.square().sum(dim=0).clamp_min(1.0e-8)
+    baseline_weight_params = _quantize_hif4_search(
+        transformed_weight,
+        importance=activation_second,
+    )
+    weight_params = _quantize_weight_with_block_hessian(
+        transformed_weight,
+        activation_second,
+        _build_block_hessian(transformed_activations, channels),
+        baseline_weight_params,
+    )
     return {
-        "weight_params": _quantize_hif4_search(
-            rotated_weight,
-            radius=_SEARCH_RADIUS,
-        ),
+        "weight_params": weight_params,
         "activation_state": {
-            "rotation_block": 4,
+            "rotation_block": 64,
             "rotation_signs": rotation_signs,
-            "importance": activation_importance,
+            "smooth_scale": smooth.detach().cpu().contiguous(),
+            "importance": activation_importance.detach().cpu().contiguous(),
         },
     }
 
@@ -595,10 +1131,16 @@ def hif4_dynamic_quantize_activation(
         当前 Activation 对应的 HiF4Params。
         输出参数的逻辑 Tensor shape 必须与当前 Activation 一致。
     """
-    activation = dequantize_nvfp4(
+    activation = _dequantize_nvfp4_fp32(
         activation_quant,
         activation_scale,
-    ).to(torch.float32)
+    )
+    if isinstance(activation_state, dict) and "smooth_scale" in activation_state:
+        smooth = activation_state["smooth_scale"].to(
+            device=activation.device,
+            dtype=torch.float32,
+        )
+        activation = activation / smooth
     if isinstance(activation_state, dict) and "rotation_signs" in activation_state:
         activation = _apply_hadamard_rotation(
             activation,
@@ -610,7 +1152,6 @@ def hif4_dynamic_quantize_activation(
         importance = activation_state["importance"]
     return _quantize_hif4_search(
         activation,
-        radius=_SEARCH_RADIUS,
         importance=importance,
     )
 
@@ -685,31 +1226,73 @@ def hif4_calibration_attention(
         raise ValueError(
             f"q_num_heads {q_num_heads} is not divisible by kv_num_heads {kv_num_heads}"
         )
-    # H8 mixes the two four-value level-3 children under one level-2 scale.
-    # Use the same rotation for each KV head and every Q head mapped to it, so
-    # the pre-quantization Q @ K.T logits remain unchanged.
-    rotation_block = next(
-        (candidate for candidate in (8, 4, 2) if head_dim % candidate == 0),
-        1,
-    )
-    k_signs = _deterministic_signs(
-        kv_num_heads * head_dim,
-        seed=_ATTENTION_ROTATION_SEED,
-    ).reshape(kv_num_heads, head_dim)
     q_per_kv = q_num_heads // kv_num_heads
-    q_signs = k_signs.repeat_interleave(q_per_kv, dim=0).reshape(-1).contiguous()
-    k_signs = k_signs.reshape(-1).contiguous()
-    del calib_qkv_list
+    q_abs_max = torch.zeros((q_num_heads, head_dim), dtype=torch.float32)
+    k_abs_max = torch.zeros((kv_num_heads, head_dim), dtype=torch.float32)
+    v_weighted_energy = torch.zeros((kv_num_heads, head_dim), dtype=torch.float32)
+    v_usage_total = torch.zeros((kv_num_heads, 1), dtype=torch.float32)
+    for sample in calib_qkv_list:
+        q = _dequantize_nvfp4_fp32(*sample["q"])
+        k = _dequantize_nvfp4_fp32(*sample["k"])
+        v = _dequantize_nvfp4_fp32(*sample["v"])
+        q_abs_max = torch.maximum(
+            q_abs_max,
+            q.reshape(-1, q_num_heads, head_dim).abs().amax(dim=0).cpu(),
+        )
+        k_abs_max = torch.maximum(
+            k_abs_max,
+            k.reshape(-1, kv_num_heads, head_dim).abs().amax(dim=0).cpu(),
+        )
+        sample_energy, sample_usage = _attention_weighted_v_energy(
+            q,
+            k,
+            v,
+            q_num_heads,
+            kv_num_heads,
+            head_dim,
+        )
+        v_weighted_energy += sample_energy.cpu()
+        v_usage_total += sample_usage.cpu()
+
+    q_group_max = q_abs_max.reshape(
+        kv_num_heads,
+        q_per_kv,
+        head_dim,
+    ).amax(dim=1)
+    kv_smooth = _smooth_scale(
+        q_group_max,
+        k_abs_max,
+        _ATTENTION_SMOOTH_ALPHA,
+    ).cpu()
+    q_smooth = kv_smooth[:, None, :].expand(
+        kv_num_heads,
+        q_per_kv,
+        head_dim,
+    ).reshape(q_num_heads, head_dim).contiguous()
+
+    # Reset the signed H64 pattern in every head and share it across mapped
+    # Q/K heads.  Q/s and K*s followed by the same orthogonal transform leave
+    # the full-precision attention logits unchanged before quantization.
+    head_signs = _block_signs64(head_dim).reshape(1, head_dim)
+    q_signs = head_signs.expand(q_num_heads, head_dim).reshape(-1).contiguous()
+    k_signs = head_signs.expand(kv_num_heads, head_dim).reshape(-1).contiguous()
     return {
         "q_state": {
-            "rotation_block": rotation_block,
+            "rotation_block": 64,
             "rotation_signs": q_signs,
+            "smooth_scale": q_smooth,
         },
         "k_state": {
-            "rotation_block": rotation_block,
+            "rotation_block": 64,
             "rotation_signs": k_signs,
+            "smooth_scale": kv_smooth.contiguous(),
         },
-        "v_state": None,
+        "v_state": {
+            "importance": _finalize_v_importance(
+                v_weighted_energy,
+                v_usage_total,
+            ),
+        },
     }
 
 
@@ -747,21 +1330,20 @@ def hif4_dynamic_quantize_q(
     Returns:
         当前 Q 对应的 HiF4Params。
     """
-    del q_num_heads, head_dim
-    q = dequantize_nvfp4(q_quant, q_scale).to(torch.float32)
-    if isinstance(q_state, dict) and "pair_scale" in q_state:
-        pair_scale = q_state["pair_scale"].to(
+    q = _dequantize_nvfp4_fp32(q_quant, q_scale)
+    if isinstance(q_state, dict) and "smooth_scale" in q_state:
+        smooth = q_state["smooth_scale"].to(
             device=q.device,
             dtype=torch.float32,
         )
-        q = q / pair_scale
+        q = (q.reshape(-1, q_num_heads, head_dim) / smooth).reshape(q.shape)
     if isinstance(q_state, dict) and "rotation_signs" in q_state:
         q = _apply_hadamard_rotation(
             q,
             q_state["rotation_signs"],
             int(q_state.get("rotation_block", 8)),
         )
-    return _quantize_hif4_search(q, radius=_SEARCH_RADIUS)
+    return _quantize_hif4_search(q)
 
 
 # =============================================================================
@@ -798,21 +1380,20 @@ def hif4_dynamic_quantize_k(
     Returns:
         当前 K 对应的 HiF4Params。
     """
-    del kv_num_heads, head_dim
-    k = dequantize_nvfp4(k_quant, k_scale).to(torch.float32)
-    if isinstance(k_state, dict) and "pair_scale" in k_state:
-        pair_scale = k_state["pair_scale"].to(
+    k = _dequantize_nvfp4_fp32(k_quant, k_scale)
+    if isinstance(k_state, dict) and "smooth_scale" in k_state:
+        smooth = k_state["smooth_scale"].to(
             device=k.device,
             dtype=torch.float32,
         )
-        k = k * pair_scale
+        k = (k.reshape(-1, kv_num_heads, head_dim) * smooth).reshape(k.shape)
     if isinstance(k_state, dict) and "rotation_signs" in k_state:
         k = _apply_hadamard_rotation(
             k,
             k_state["rotation_signs"],
             int(k_state.get("rotation_block", 8)),
         )
-    return _quantize_hif4_search(k, radius=_SEARCH_RADIUS)
+    return _quantize_hif4_search(k)
 
 
 # =============================================================================
@@ -849,6 +1430,44 @@ def hif4_dynamic_quantize_v(
     Returns:
         当前 V 对应的 HiF4Params。
     """
-    del kv_num_heads, head_dim, v_state
-    v = dequantize_nvfp4(v_quant, v_scale).to(torch.float32)
-    return _quantize_hif4_search(v, radius=_SEARCH_RADIUS)
+    v = _dequantize_nvfp4_fp32(v_quant, v_scale)
+    if not isinstance(v_state, dict) or "importance" not in v_state:
+        return _quantize_hif4_search(v)
+
+    importance = v_state["importance"].to(
+        device=v.device,
+        dtype=torch.float32,
+    ).reshape(-1)
+    if importance.numel() != kv_num_heads * head_dim:
+        raise ValueError("V importance shape does not match attention dimensions")
+    baseline = _quantize_hif4_search(v)
+    candidate = _quantize_hif4_search(v, importance=importance)
+    baseline_error = (v - _reconstruct_hif4(baseline, v)).square().reshape(-1, 64)
+    candidate_error = (v - _reconstruct_hif4(candidate, v)).square().reshape(-1, 64)
+    weight_blocks = importance.reshape(-1, 64).unsqueeze(0).expand(
+        int(v.shape[0]),
+        -1,
+        -1,
+    ).reshape(-1, 64)
+    baseline_plain = baseline_error.sum(dim=-1)
+    candidate_plain = candidate_error.sum(dim=-1)
+    baseline_weighted = (baseline_error * weight_blocks).sum(dim=-1)
+    candidate_weighted = (candidate_error * weight_blocks).sum(dim=-1)
+    use_candidate = (
+        candidate_weighted
+        < baseline_weighted * (1.0 - _V_MIN_WEIGHTED_IMPROVEMENT)
+    ) & (
+        candidate_plain
+        <= baseline_plain * (1.0 + _V_MAX_PLAIN_REGRESSION)
+    )
+    mask = use_candidate.reshape(
+        int(v.shape[0]),
+        int(v.shape[-1]) // 64,
+        1,
+        1,
+        1,
+    )
+    return {
+        key: torch.where(mask, candidate[key], baseline[key]).contiguous()
+        for key in baseline
+    }
