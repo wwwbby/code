@@ -225,7 +225,7 @@ def _evaluate_hif4_scale_candidates(
 def _quantize_hif4(
     x: torch.Tensor,
     error_weights: torch.Tensor | None = None,
-    enable_refinement: bool = True,
+    enable_refinement: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Quantize FP32 values with guarded two-stage weighted MSE search."""
 
@@ -1059,11 +1059,9 @@ def hif4_calibration_and_quantize_weight(
 
     activation_second = torch.zeros_like(smooth)
     activation_count = 0
-    transformed_activations: list[torch.Tensor] = []
     for quant, scale in calib_activation_list:
         activation = _dequantize_nvfp4_fp32(quant, scale)
         transformed = _apply_block_hadamard(activation / smooth)
-        transformed_activations.append(transformed)
         activation_second += transformed.square().sum(
             dim=tuple(range(transformed.ndim - 1))
         )
@@ -1071,22 +1069,13 @@ def hif4_calibration_and_quantize_weight(
     activation_second = activation_second / max(activation_count, 1)
     activation_second = activation_second.clamp_min(1.0e-8)
 
-    # v5: replace the diagonal objective with the damped per-block Hessian.
-    # The exact v4 parameters remain the guard candidate for every block.
-    hessian_reg = _build_block_hessian_reg(transformed_activations, channels)
-    v4_weight_params = _quantize_hif4(transformed_weight, activation_second)
-    weight_params = _quantize_hif4_block_hessian_weight(
-        transformed_weight,
-        activation_second,
-        hessian_reg,
-        v4_weight_params,
-    )
+    weight_params = _quantize_hif4(transformed_weight, activation_second)
 
     activation_importance = transformed_weight.square().sum(dim=0).clamp_min(1.0e-8)
     state = _make_state("activation")
     state.update({
-        "schema_version": 6,
-        "algorithm": "hif4-v5-block-hessian-weight",
+        "schema_version": 2,
+        "algorithm": "hif4-fast-smooth-hadamard-weighted",
         "smooth_scale": smooth.detach().cpu().contiguous(),
         "error_weights": activation_importance.detach().cpu().contiguous(),
         "smooth_alpha": _LINEAR_SMOOTH_ALPHA,
