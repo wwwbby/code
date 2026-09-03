@@ -84,6 +84,9 @@ def _build_e6m2_values() -> tuple[float, ...]:
 
 _E6M2_VALUES = _build_e6m2_values()
 _E6M2_TABLE_CPU = torch.tensor(_E6M2_VALUES, dtype=torch.float32)
+_SEARCH_RADIUS = 3
+_LINEAR_ROTATION_SEED = 2
+_ATTENTION_ROTATION_SEED = 7
 
 
 def _deterministic_signs(length: int, seed: int) -> torch.Tensor:
@@ -533,11 +536,17 @@ def hif4_calibration_and_quantize_weight(
     # R = D @ H4 is orthogonal.  Quantizing W @ R offline and A @ R online
     # preserves A @ W.T before quantization while spreading four-value outliers
     # within exactly one HiF4 level-3 group.
-    rotation_signs = _deterministic_signs(int(weight.shape[-1]), seed=20260903)
+    rotation_signs = _deterministic_signs(
+        int(weight.shape[-1]),
+        seed=_LINEAR_ROTATION_SEED,
+    )
     rotated_weight = _apply_hadamard_rotation(weight, rotation_signs, block_size=4)
     del calib_activation_list
     return {
-        "weight_params": _quantize_hif4_search(rotated_weight, radius=2),
+        "weight_params": _quantize_hif4_search(
+            rotated_weight,
+            radius=_SEARCH_RADIUS,
+        ),
         "activation_state": {
             "rotation_block": 4,
             "rotation_signs": rotation_signs,
@@ -586,7 +595,7 @@ def hif4_dynamic_quantize_activation(
             activation_state["rotation_signs"],
             int(activation_state.get("rotation_block", 4)),
         )
-    return _quantize_hif4_search(activation, radius=2)
+    return _quantize_hif4_search(activation, radius=_SEARCH_RADIUS)
 
 
 # =============================================================================
@@ -666,9 +675,10 @@ def hif4_calibration_attention(
         (candidate for candidate in (8, 4, 2) if head_dim % candidate == 0),
         1,
     )
-    k_signs = _deterministic_signs(kv_num_heads * head_dim, seed=424242).reshape(
-        kv_num_heads, head_dim
-    )
+    k_signs = _deterministic_signs(
+        kv_num_heads * head_dim,
+        seed=_ATTENTION_ROTATION_SEED,
+    ).reshape(kv_num_heads, head_dim)
     q_per_kv = q_num_heads // kv_num_heads
     q_signs = k_signs.repeat_interleave(q_per_kv, dim=0).reshape(-1).contiguous()
     k_signs = k_signs.reshape(-1).contiguous()
@@ -734,7 +744,7 @@ def hif4_dynamic_quantize_q(
             q_state["rotation_signs"],
             int(q_state.get("rotation_block", 8)),
         )
-    return _quantize_hif4_search(q, radius=2)
+    return _quantize_hif4_search(q, radius=_SEARCH_RADIUS)
 
 
 # =============================================================================
@@ -785,7 +795,7 @@ def hif4_dynamic_quantize_k(
             k_state["rotation_signs"],
             int(k_state.get("rotation_block", 8)),
         )
-    return _quantize_hif4_search(k, radius=2)
+    return _quantize_hif4_search(k, radius=_SEARCH_RADIUS)
 
 
 # =============================================================================
@@ -824,4 +834,4 @@ def hif4_dynamic_quantize_v(
     """
     del kv_num_heads, head_dim, v_state
     v = dequantize_nvfp4(v_quant, v_scale).to(torch.float32)
-    return _quantize_hif4_search(v, radius=2)
+    return _quantize_hif4_search(v, radius=_SEARCH_RADIUS)

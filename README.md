@@ -34,10 +34,10 @@ Linear `A @ W` calibration target.
 
 Using the synthetic benchmark committed here:
 
-- Linear score mean: `0.465697`
-- Attention score mean: `0.412388`
-- Combined score sum: `4.390427`
-- Combined score mean: `0.439043`
+- Linear score mean: `0.459692`
+- Attention score mean: `0.435800`
+- Combined score sum: `4.477461`
+- Combined score mean: `0.447746`
 
 The rotation states contain only CPU tensors and primitive values, and the
 generated output shapes and HiF4 values pass the local contract checks. Run the
