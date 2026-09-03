@@ -26,6 +26,7 @@ Attention:
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import torch
@@ -77,6 +78,14 @@ _HESSIAN_CHUNK_BLOCKS = 8192
 _HESSIAN_MIN_REPLACE_IMPROVEMENT = 0.01
 _HESSIAN_LOW_RANK = 8
 _HESSIAN_LOW_RANK_SWEEPS = 1
+_ATTENTION_HESSIAN_MAX_TOKENS = 128
+_ATTENTION_HESSIAN_MIN_REPLACE_IMPROVEMENT = 0.30
+_ATTENTION_HESSIAN_SWEEPS = 2
+_V_IMPORTANCE_MAX_QUERY_POSITIONS = 128
+_V_IMPORTANCE_MIN_WEIGHTED_IMPROVEMENT = 0.01
+_V_IMPORTANCE_MAX_PLAIN_REGRESSION = 0.0025
+_V_IMPORTANCE_POWER = 0.25
+_V_IMPORTANCE_BLEND = 0.75
 
 
 # =============================================================================
@@ -664,6 +673,100 @@ def _factor_low_rank_hessian(
     return residual_diagonal.contiguous(), factors.contiguous()
 
 
+def _normalize_block_hessian(hessian: torch.Tensor) -> torch.Tensor:
+    """Normalize a batch of 64x64 covariances and add diagonal damping."""
+
+    flat = hessian.reshape(-1, _HIF4_BLOCK_SIZE, _HIF4_BLOCK_SIZE)
+    trace = torch.diagonal(flat, dim1=-2, dim2=-1).sum(dim=-1)
+    normalization = (trace / float(_HIF4_BLOCK_SIZE)).clamp_min(1.0e-8)
+    eye = torch.eye(_HIF4_BLOCK_SIZE, dtype=torch.float32)[None]
+    return flat / normalization[:, None, None] + _HESSIAN_DAMPING * eye
+
+
+def _attention_v_statistics(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_num_heads: int,
+    kv_num_heads: int,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return squared-attention-weighted V energy and total usage."""
+
+    length = int(q.shape[0])
+    q_heads = q.reshape(length, q_num_heads, head_dim).permute(1, 0, 2)
+    k_heads = k.reshape(length, kv_num_heads, head_dim).permute(1, 0, 2)
+    v_energy = v.reshape(length, kv_num_heads, head_dim).permute(1, 0, 2).square()
+    if length > _V_IMPORTANCE_MAX_QUERY_POSITIONS:
+        positions = torch.linspace(
+            0,
+            length - 1,
+            steps=_V_IMPORTANCE_MAX_QUERY_POSITIONS,
+            dtype=torch.float32,
+        ).round().to(torch.int64)
+    else:
+        positions = torch.arange(length, dtype=torch.int64)
+    key_positions = torch.arange(length, dtype=torch.int64)
+    q_per_kv = q_num_heads // kv_num_heads
+    energy = torch.zeros((kv_num_heads, head_dim), dtype=torch.float32)
+    usage_total = torch.zeros((kv_num_heads, 1), dtype=torch.float32)
+    for head in range(kv_num_heads):
+        queries = q_heads[
+            head * q_per_kv:(head + 1) * q_per_kv,
+            positions,
+        ].float()
+        logits = queries @ k_heads[head].float().T / math.sqrt(float(head_dim))
+        full = torch.softmax(logits, dim=-1)
+        causal_mask = key_positions[None, :] <= positions[:, None]
+        causal = torch.softmax(
+            logits.masked_fill(~causal_mask[None], float("-inf")),
+            dim=-1,
+        )
+        usage = 0.5 * (
+            full.square().sum(dim=(0, 1))
+            + causal.square().sum(dim=(0, 1))
+        )
+        energy[head] = (usage[:, None] * v_energy[head]).sum(dim=0)
+        usage_total[head, 0] = usage.sum()
+    return energy, usage_total
+
+
+def _finalize_v_importance(
+    weighted_energy: torch.Tensor,
+    usage_total: torch.Tensor,
+) -> torch.Tensor:
+    """Convert attention-weighted V energy into conservative block weights."""
+
+    relative = weighted_energy / usage_total.clamp_min(1.0e-8)
+    median = relative.median(dim=-1, keepdim=True).values
+    compressed = (
+        (relative / median.clamp_min(1.0e-8))
+        .clamp_min(0.0)
+        .pow(_V_IMPORTANCE_POWER)
+    )
+    importance = (
+        1.0 - _V_IMPORTANCE_BLEND
+        + _V_IMPORTANCE_BLEND * compressed.clamp(min=0.5, max=2.0)
+    )
+    importance = torch.nan_to_num(importance, nan=1.0, posinf=1.0, neginf=1.0)
+    blocks = importance.reshape(-1, 64)
+    blocks = blocks / blocks.mean(dim=-1, keepdim=True).clamp_min(1.0e-8)
+    return blocks.reshape_as(importance).cpu().contiguous()
+
+
+def _reconstruct_hif4_like(
+    params: dict[str, torch.Tensor],
+    reference: torch.Tensor,
+) -> torch.Tensor:
+    return (
+        params["sign"]
+        * params["mant"]
+        * params["scale_lv2"]
+        * params["scale_lv3"]
+        * params["scale_factor"]
+    ).reshape_as(reference)
+
+
 def _materialize_hif4_values(
     values: torch.Tensor,
     abs_values: torch.Tensor,
@@ -1106,6 +1209,8 @@ def _quantize_hif4_low_rank_hessian(
     values: torch.Tensor,
     hessian_reg: torch.Tensor,
     baseline: dict[str, torch.Tensor],
+    min_replace_improvement: float = _HESSIAN_MIN_REPLACE_IMPROVEMENT,
+    sweep_rounds: int = _HESSIAN_LOW_RANK_SWEEPS,
 ) -> dict[str, torch.Tensor]:
     """Refine local scales under an exact-diagonal plus rank-r Hessian."""
 
@@ -1156,7 +1261,7 @@ def _quantize_hif4_low_rank_hessian(
         )
         cache = _combo_cache(batch.abs(), torch.sign(batch), scale)
 
-        for _ in range(_HESSIAN_LOW_RANK_SWEEPS):
+        for _ in range(sweep_rounds):
             for group in range(8):
                 group_start = group * 8
                 group_end = group_start + 8
@@ -1224,9 +1329,7 @@ def _quantize_hif4_low_rank_hessian(
             "sign": sign,
             "mant": mantissa,
         }
-        use_improved = loss < baseline_loss * (
-            1.0 - _HESSIAN_MIN_REPLACE_IMPROVEMENT
-        )
+        use_improved = loss < baseline_loss * (1.0 - min_replace_improvement)
         condition = use_improved.reshape(batch_size, 1, 1, 1)
         for key in output:
             output[key][start:end] = torch.where(
@@ -1643,15 +1746,20 @@ def hif4_calibration_attention(
 
     q_abs_max = torch.zeros((q_num_heads, head_dim), dtype=torch.float32)
     k_abs_max = torch.zeros((kv_num_heads, head_dim), dtype=torch.float32)
+    v_weighted_energy = torch.zeros((kv_num_heads, head_dim), dtype=torch.float32)
+    v_usage_total = torch.zeros((kv_num_heads, 1), dtype=torch.float32)
     for sample in calib_qkv_list:
         if type(sample) is not dict:
             raise ValueError("each attention calibration sample must be a dict")
         q_quant, q_scale = sample["q"]
         k_quant, k_scale = sample["k"]
+        v_quant, v_scale = sample["v"]
         q = _dequantize_nvfp4_fp32(q_quant, q_scale)
         k = _dequantize_nvfp4_fp32(k_quant, k_scale)
+        v = _dequantize_nvfp4_fp32(v_quant, v_scale)
         _validate_attention_shape(q_quant, q_num_heads, head_dim, "q calibration")
         _validate_attention_shape(k_quant, kv_num_heads, head_dim, "k calibration")
+        _validate_attention_shape(v_quant, kv_num_heads, head_dim, "v calibration")
         q_abs_max = torch.maximum(
             q_abs_max,
             q.reshape(-1, q_num_heads, head_dim).abs().amax(dim=0).cpu(),
@@ -1660,6 +1768,16 @@ def hif4_calibration_attention(
             k_abs_max,
             k.reshape(-1, kv_num_heads, head_dim).abs().amax(dim=0).cpu(),
         )
+        sample_energy, sample_usage = _attention_v_statistics(
+            q,
+            k,
+            v,
+            q_num_heads,
+            kv_num_heads,
+            head_dim,
+        )
+        v_weighted_energy += sample_energy.cpu()
+        v_usage_total += sample_usage.cpu()
 
     q_per_kv = q_abs_max.reshape(
         kv_num_heads,
@@ -1677,21 +1795,96 @@ def hif4_calibration_attention(
         head_dim,
     ).reshape(q_num_heads, head_dim).contiguous()
 
+    # Build opposite-side covariance targets for direct QK-logit sensitivity.
+    # Q errors are scored under calibration K, while K errors are scored under
+    # all matching grouped-query heads.  A bounded token sketch keeps this
+    # calibration work small; the rank-8 factorization happens inside the
+    # shared low-rank quantizer.
+    head_blocks = head_dim // _HIF4_BLOCK_SIZE
+    q_covariance = torch.zeros(
+        (q_num_heads, head_blocks, 64, 64),
+        dtype=torch.float32,
+    )
+    k_covariance = torch.zeros(
+        (kv_num_heads, head_blocks, 64, 64),
+        dtype=torch.float32,
+    )
+    sampled_tokens = 0
+    for sample in calib_qkv_list:
+        q = _dequantize_nvfp4_fp32(*sample["q"])
+        k = _dequantize_nvfp4_fp32(*sample["k"])
+        token_count = int(q.shape[0])
+        if token_count > _ATTENTION_HESSIAN_MAX_TOKENS:
+            positions = torch.linspace(
+                0,
+                token_count - 1,
+                steps=_ATTENTION_HESSIAN_MAX_TOKENS,
+                dtype=torch.float32,
+            ).round().to(torch.int64)
+            q = q[positions]
+            k = k[positions]
+        q_transformed = _apply_attention_hadamard(
+            (q.reshape(-1, q_num_heads, head_dim) / q_smooth).reshape_as(q),
+            q_num_heads,
+            head_dim,
+        ).reshape(-1, q_num_heads, head_blocks, 64)
+        k_transformed = _apply_attention_hadamard(
+            (k.reshape(-1, kv_num_heads, head_dim) * kv_smooth).reshape_as(k),
+            kv_num_heads,
+            head_dim,
+        ).reshape(-1, kv_num_heads, head_blocks, 64)
+        q_covariance += torch.einsum(
+            "thbi,thbj->hbij",
+            q_transformed,
+            q_transformed,
+        ).cpu()
+        k_covariance += torch.einsum(
+            "thbi,thbj->hbij",
+            k_transformed,
+            k_transformed,
+        ).cpu()
+        sampled_tokens += int(q_transformed.shape[0])
+
+    q_per_kv = q_num_heads // kv_num_heads
+    q_hessian = _normalize_block_hessian(
+        (k_covariance / max(sampled_tokens, 1))
+        .repeat_interleave(q_per_kv, dim=0)
+    ).cpu().contiguous()
+    k_hessian = _normalize_block_hessian(
+        q_covariance.reshape(
+            kv_num_heads,
+            q_per_kv,
+            head_blocks,
+            64,
+            64,
+        ).mean(dim=1) / max(sampled_tokens, 1)
+    ).cpu().contiguous()
+
     q_state = _make_state("q")
     q_state.update({
         "smooth_scale": q_smooth,
+        "logit_hessian": q_hessian,
         "smooth_alpha": _ATTENTION_SMOOTH_ALPHA,
         "rotation": "per-head-signed-hadamard-64",
     })
     k_state = _make_state("k")
     k_state.update({
         "smooth_scale": kv_smooth.contiguous(),
+        "logit_hessian": k_hessian,
         "smooth_alpha": _ATTENTION_SMOOTH_ALPHA,
         "rotation": "per-head-signed-hadamard-64",
     })
     v_state = _make_state("v")
-    v_state["calibration_used"] = False
-    v_state["rotation"] = "none"
+    v_state.update({
+        "schema_version": 9,
+        "algorithm": "hif4-attention-weighted-v",
+        "calibration_used": True,
+        "rotation": "none",
+        "v_importance": _finalize_v_importance(
+            v_weighted_energy,
+            v_usage_total,
+        ),
+    })
     return {"q_state": q_state, "k_state": k_state, "v_state": v_state}
 
 
@@ -1735,6 +1928,11 @@ def hif4_dynamic_quantize_q(
         "smooth_scale",
         (q_num_heads, head_dim),
     )
+    hessian = _state_tensor(
+        q_state,
+        "logit_hessian",
+        (q_num_heads * head_dim // _HIF4_BLOCK_SIZE, 64, 64),
+    )
     q = _dequantize_nvfp4_fp32(q_quant, q_scale)
     transformed = (q.reshape(-1, q_num_heads, head_dim) / smooth).reshape_as(q)
     transformed = _apply_attention_hadamard(
@@ -1742,7 +1940,14 @@ def hif4_dynamic_quantize_q(
         q_num_heads,
         head_dim,
     )
-    return _quantize_hif4(transformed)
+    baseline = _quantize_hif4(transformed)
+    return _quantize_hif4_low_rank_hessian(
+        transformed,
+        hessian,
+        baseline,
+        _ATTENTION_HESSIAN_MIN_REPLACE_IMPROVEMENT,
+        _ATTENTION_HESSIAN_SWEEPS,
+    )
 
 
 # =============================================================================
@@ -1785,6 +1990,11 @@ def hif4_dynamic_quantize_k(
         "smooth_scale",
         (kv_num_heads, head_dim),
     )
+    hessian = _state_tensor(
+        k_state,
+        "logit_hessian",
+        (kv_num_heads * head_dim // _HIF4_BLOCK_SIZE, 64, 64),
+    )
     k = _dequantize_nvfp4_fp32(k_quant, k_scale)
     transformed = (k.reshape(-1, kv_num_heads, head_dim) * smooth).reshape_as(k)
     transformed = _apply_attention_hadamard(
@@ -1792,7 +2002,14 @@ def hif4_dynamic_quantize_k(
         kv_num_heads,
         head_dim,
     )
-    return _quantize_hif4(transformed)
+    baseline = _quantize_hif4(transformed)
+    return _quantize_hif4_low_rank_hessian(
+        transformed,
+        hessian,
+        baseline,
+        _ATTENTION_HESSIAN_MIN_REPLACE_IMPROVEMENT,
+        _ATTENTION_HESSIAN_SWEEPS,
+    )
 
 
 # =============================================================================
@@ -1829,6 +2046,43 @@ def hif4_dynamic_quantize_v(
     Returns:
         当前 V 对应的 HiF4Params。
     """
-    _ = v_state
     _validate_attention_shape(v_quant, kv_num_heads, head_dim, "v")
-    return _quantize_nvfp4_pair(v_quant, v_scale)
+    v = _dequantize_nvfp4_fp32(v_quant, v_scale)
+    importance = _state_tensor(
+        v_state,
+        "v_importance",
+        (kv_num_heads, head_dim),
+    ).reshape(-1)
+    baseline = _quantize_hif4(v)
+    candidate = _quantize_hif4(v, importance)
+    baseline_value = _reconstruct_hif4_like(baseline, v)
+    candidate_value = _reconstruct_hif4_like(candidate, v)
+    baseline_error = (v - baseline_value).square().reshape(-1, 64)
+    candidate_error = (v - candidate_value).square().reshape(-1, 64)
+    weights = importance.reshape(-1, 64)[None].expand(
+        int(v.shape[0]),
+        -1,
+        -1,
+    ).reshape(-1, 64)
+    baseline_plain = baseline_error.sum(dim=-1)
+    candidate_plain = candidate_error.sum(dim=-1)
+    baseline_weighted = (baseline_error * weights).sum(dim=-1)
+    candidate_weighted = (candidate_error * weights).sum(dim=-1)
+    use_candidate = (
+        candidate_weighted
+        < baseline_weighted * (1.0 - _V_IMPORTANCE_MIN_WEIGHTED_IMPROVEMENT)
+    ) & (
+        candidate_plain
+        <= baseline_plain * (1.0 + _V_IMPORTANCE_MAX_PLAIN_REGRESSION)
+    )
+    use_candidate = use_candidate.reshape(
+        int(v.shape[0]),
+        int(v.shape[-1]) // 64,
+        1,
+        1,
+        1,
+    )
+    return {
+        key: torch.where(use_candidate, candidate[key], baseline[key]).contiguous()
+        for key in baseline
+    }

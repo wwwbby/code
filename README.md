@@ -30,8 +30,11 @@ of the block-Hessian benefit without the expensive dense 64x64 updates.
 
 Q and K use reciprocal per-channel smoothing with a zero-overhead `0.4375`
 balance, followed by the same signed H64 transform inside every attention
-head. V stays in its original basis because the interface has no
-inverse-transform hook and uses the same fast search.
+head. Calibration builds opposite-side covariance sketches: K guides Q and
+grouped Q guides K. Rank-8 refinement is accepted only after a conservative
+30% proxy-loss improvement and uses two bounded local sweeps. V stays in its
+original basis and uses attention-probability-weighted channel importance with
+a plain-MSE guard.
 
 The paired Linear and Q/K transforms are algebraically cancelling, so they
 preserve the unquantized Linear output and attention logits exactly apart from
@@ -47,8 +50,8 @@ On the organizer's public mini sample:
 - official output-format checks: `22/22` passed;
 - Linear output NMSE cases: `0.00025638`, `0.00031286`, `0.00028422`,
   `0.00031588`, `0.00028812` (mean `0.00029149`);
-- mixed causal/full Attention output NMSE: `0.00470634`;
-- full self-check runtime on the development machine: about `24 s`.
+- mixed causal/full Attention output NMSE: `0.00461283`;
+- full self-check runtime on the development machine: about `25 s`.
 
 The local-scale solver algebraically reduces eight hierarchy combinations to
 three effective total scales while preserving the original tie breaks. The
@@ -57,8 +60,11 @@ measured `15600` points in `248 s` on the current contest server. These online
 measurements are the runtime baseline, rather than historical public reports
 from a different evaluator. Rank-8 refinement retains about `95.5%` of the
 previous Hessian-lite public Linear improvement while reducing the full local
-self-check time by about `10.6%`. A fresh hidden-set submission is still
-authoritative for this revision.
+self-check time enough to fund covariance-aware Q/K and guarded V refinement.
+The combined Attention additions improve the public proxy by about `1.99%`
+relative to `5b922c8`, while the complete local runtime remains below that
+revision's roughly `27 s`. A fresh hidden-set submission is still authoritative
+for this revision.
 
 ## Run the proxy benchmark
 
