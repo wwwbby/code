@@ -28,9 +28,10 @@ keeps each block's refined global scale fixed and performs two guarded local
 coordinate sweeps; this captures most of the block-covariance benefit without
 the full 17-scale Hessian search that timed out.
 
-Q and K use reciprocal per-channel smoothing followed by the same signed H64
-transform inside every attention head. V stays in its original basis because
-the interface has no inverse-transform hook and uses the same fast search.
+Q and K use reciprocal per-channel smoothing with a zero-overhead `0.4375`
+balance, followed by the same signed H64 transform inside every attention
+head. V stays in its original basis because the interface has no
+inverse-transform hook and uses the same fast search.
 
 The paired Linear and Q/K transforms are algebraically cancelling, so they
 preserve the unquantized Linear output and attention logits exactly apart from
@@ -46,16 +47,18 @@ On the organizer's public mini sample:
 - official output-format checks: `22/22` passed;
 - Linear output NMSE cases: `0.00025313`, `0.00030953`, `0.00028150`,
   `0.00031212`, `0.00028546` (mean `0.00028835`);
-- mixed causal/full Attention output NMSE: `0.00506813`;
-- full self-check runtime on the development machine: about `28 s`.
+- mixed causal/full Attention output NMSE: `0.00470634`;
+- full self-check runtime on the development machine: about `27 s`.
 
 The local-scale solver algebraically reduces eight hierarchy combinations to
-three effective total scales while preserving the original tie breaks. Its
-numerical path matches the public refinement implementation associated with a
-reported score of `22024` and a server runtime around `210 s`, while the local
-kernel is substantially faster. Hessian-lite reduces the public Linear output
-NMSE by another `19.5%`; a fresh hidden-set submission is still the authoritative
-score and runtime for this repository revision.
+three effective total scales while preserving the original tie breaks. The
+earlier `d75e03a` revision measured `15300` points in `261 s` on the current
+contest server; this online measurement is the runtime baseline, rather than
+historical public score reports from a different evaluator. Hessian-lite
+reduces the public Linear output NMSE by another `19.5%`, while the revised Q/K
+balance reduces the public Attention proxy NMSE by `7.14%` without adding a
+new runtime pass. A fresh hidden-set submission is still authoritative for
+this revision.
 
 ## Run the proxy benchmark
 
