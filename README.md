@@ -23,7 +23,10 @@ For every 64-value HiF4 block, the implementation:
 Linear calibration applies reciprocal SmoothQuant-style scaling and a shared
 signed H64 transform to weights and activations. Weight scale selection uses
 activation second moments. Dynamic activation search is weighted by the
-transformed weight's output sensitivity.
+transformed weight's output sensitivity. A budgeted Hessian-lite pass then
+keeps each block's refined global scale fixed and performs two guarded local
+coordinate sweeps; this captures most of the block-covariance benefit without
+the full 17-scale Hessian search that timed out.
 
 Q and K use reciprocal per-channel smoothing followed by the same signed H64
 transform inside every attention head. V stays in its original basis because
@@ -41,17 +44,18 @@ Linear `A @ W` calibration target.
 On the organizer's public mini sample:
 
 - official output-format checks: `22/22` passed;
-- Linear output NMSE cases: `0.00029117`, `0.00037048`, `0.00035774`,
-  `0.00039941`, `0.00036960` (mean `0.00035768`);
-- mixed causal/full Attention output NMSE: `0.00509731`;
-- full self-check runtime on the development machine: about `20 s`.
+- Linear output NMSE cases: `0.00025313`, `0.00030953`, `0.00028150`,
+  `0.00031212`, `0.00028546` (mean `0.00028835`);
+- mixed causal/full Attention output NMSE: `0.00506813`;
+- full self-check runtime on the development machine: about `28 s`.
 
 The local-scale solver algebraically reduces eight hierarchy combinations to
 three effective total scales while preserving the original tie breaks. Its
 numerical path matches the public refinement implementation associated with a
 reported score of `22024` and a server runtime around `210 s`, while the local
-kernel is substantially faster. A fresh hidden-set submission is still the
-authoritative result for this repository revision.
+kernel is substantially faster. Hessian-lite reduces the public Linear output
+NMSE by another `19.5%`; a fresh hidden-set submission is still the authoritative
+score and runtime for this repository revision.
 
 ## Run the proxy benchmark
 

@@ -999,6 +999,89 @@ def _quantize_hif4_block_hessian_weight(
     }
 
 
+def _quantize_hif4_hessian_lite(
+    values: torch.Tensor,
+    hessian_reg: torch.Tensor,
+    baseline: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Hessian-optimize local scales while keeping the fast global scale.
+
+    Full v5 evaluates 17 global scales under the Hessian.  This budgeted pass
+    retains the already refined global scale and spends two coordinate sweeps
+    only on its eight local groups, then applies the same 1% non-regression
+    gate.  It therefore preserves the baseline whenever the cheap search does
+    not find a material calibration-output improvement.
+    """
+    rows, channels = values.shape
+    block_count = channels // 64
+    total_blocks = rows * block_count
+    block_values = values.reshape(rows, block_count, 64).reshape(-1, 64)
+    block_index = torch.arange(total_blocks, device=values.device) % block_count
+    flat_baseline = {
+        key: tensor.reshape(total_blocks, *tensor.shape[2:])
+        for key, tensor in baseline.items()
+    }
+    baseline_values = (
+        flat_baseline["sign"]
+        * flat_baseline["mant"]
+        * flat_baseline["scale_lv2"]
+        * flat_baseline["scale_lv3"]
+        * flat_baseline["scale_factor"]
+    ).reshape(total_blocks, 64)
+    output = {key: tensor.clone() for key, tensor in flat_baseline.items()}
+
+    for start in range(0, total_blocks, _HESSIAN_CHUNK_BLOCKS):
+        end = min(start + _HESSIAN_CHUNK_BLOCKS, total_blocks)
+        batch = block_values[start:end]
+        batch_hessian = hessian_reg[block_index[start:end]]
+        batch_size = end - start
+        group_hessians = [
+            batch_hessian[:, group * 8:(group + 1) * 8, group * 8:(group + 1) * 8]
+            for group in range(8)
+        ]
+        hessian_columns = [
+            batch_hessian[:, :, group * 8:(group + 1) * 8]
+            for group in range(8)
+        ]
+        baseline_loss, _ = _block_hessian_loss(
+            batch - baseline_values[start:end],
+            batch_hessian,
+        )
+        scale = flat_baseline["scale_factor"][start:end].reshape(batch_size)
+        lv2 = flat_baseline["scale_lv2"][start:end].reshape(batch_size, 8)
+        lv3 = flat_baseline["scale_lv3"][start:end].reshape(batch_size, 8, 2)
+        initial_choice = (
+            (lv2 > 1.0).to(torch.int64) * 4
+            + (lv3[:, :, 0] > 1.0).to(torch.int64) * 2
+            + (lv3[:, :, 1] > 1.0).to(torch.int64)
+        )
+        improved_loss, _, improved_params = _sweep_local_scales(
+            batch,
+            batch.abs(),
+            torch.sign(batch),
+            scale,
+            initial_choice,
+            batch_hessian,
+            group_hessians,
+            hessian_columns,
+        )
+        use_improved = improved_loss < baseline_loss * (
+            1.0 - _HESSIAN_MIN_REPLACE_IMPROVEMENT
+        )
+        condition = use_improved.reshape(batch_size, 1, 1, 1)
+        for key in output:
+            output[key][start:end] = torch.where(
+                condition,
+                improved_params[key],
+                flat_baseline[key][start:end],
+            )
+
+    return {
+        key: tensor.reshape(rows, block_count, *tensor.shape[1:]).contiguous()
+        for key, tensor in output.items()
+    }
+
+
 def _block_signs64(block_count: int, device: torch.device) -> torch.Tensor:
     """Return deterministic Rademacher signs, one vector per 64D block."""
 
@@ -1244,9 +1327,11 @@ def hif4_calibration_and_quantize_weight(
 
     activation_second = torch.zeros_like(smooth)
     activation_count = 0
+    transformed_activations: list[torch.Tensor] = []
     for quant, scale in calib_activation_list:
         activation = _dequantize_nvfp4_fp32(quant, scale)
         transformed = _apply_block_hadamard(activation / smooth)
+        transformed_activations.append(transformed)
         activation_second += transformed.square().sum(
             dim=tuple(range(transformed.ndim - 1))
         )
@@ -1254,13 +1339,18 @@ def hif4_calibration_and_quantize_weight(
     activation_second = activation_second / max(activation_count, 1)
     activation_second = activation_second.clamp_min(1.0e-8)
 
-    weight_params = _quantize_hif4(transformed_weight, activation_second)
+    baseline_weight_params = _quantize_hif4(transformed_weight, activation_second)
+    weight_params = _quantize_hif4_hessian_lite(
+        transformed_weight,
+        _build_block_hessian_reg(transformed_activations, channels),
+        baseline_weight_params,
+    )
 
     activation_importance = transformed_weight.square().sum(dim=0).clamp_min(1.0e-8)
     state = _make_state("activation")
     state.update({
-        "schema_version": 2,
-        "algorithm": "hif4-fast-smooth-hadamard-weighted",
+        "schema_version": 7,
+        "algorithm": "hif4-fast-fixed-scale-hessian-lite",
         "smooth_scale": smooth.detach().cpu().contiguous(),
         "error_weights": activation_importance.detach().cpu().contiguous(),
         "smooth_alpha": _LINEAR_SMOOTH_ALPHA,
