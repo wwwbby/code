@@ -23,10 +23,10 @@ For every 64-value HiF4 block, the implementation:
 Linear calibration applies reciprocal SmoothQuant-style scaling and a shared
 signed H64 transform to weights and activations. Weight scale selection uses
 activation second moments. Dynamic activation search is weighted by the
-transformed weight's output sensitivity. A budgeted Hessian-lite pass then
-keeps each block's refined global scale fixed and performs two guarded local
-coordinate sweeps; this captures most of the block-covariance benefit without
-the full 17-scale Hessian search that timed out.
+transformed weight's output sensitivity. A rank-8 Hessian pass then keeps each
+block's refined global scale fixed and performs one guarded local coordinate
+sweep. Its exact diagonal plus eight leading covariance directions retain most
+of the block-Hessian benefit without the expensive dense 64x64 updates.
 
 Q and K use reciprocal per-channel smoothing with a zero-overhead `0.4375`
 balance, followed by the same signed H64 transform inside every attention
@@ -45,20 +45,20 @@ Linear `A @ W` calibration target.
 On the organizer's public mini sample:
 
 - official output-format checks: `22/22` passed;
-- Linear output NMSE cases: `0.00025313`, `0.00030953`, `0.00028150`,
-  `0.00031212`, `0.00028546` (mean `0.00028835`);
+- Linear output NMSE cases: `0.00025638`, `0.00031286`, `0.00028422`,
+  `0.00031588`, `0.00028812` (mean `0.00029149`);
 - mixed causal/full Attention output NMSE: `0.00470634`;
-- full self-check runtime on the development machine: about `27 s`.
+- full self-check runtime on the development machine: about `24 s`.
 
 The local-scale solver algebraically reduces eight hierarchy combinations to
 three effective total scales while preserving the original tie breaks. The
-earlier `d75e03a` revision measured `15300` points in `261 s` on the current
-contest server; this online measurement is the runtime baseline, rather than
-historical public score reports from a different evaluator. Hessian-lite
-reduces the public Linear output NMSE by another `19.5%`, while the revised Q/K
-balance reduces the public Attention proxy NMSE by `7.14%` without adding a
-new runtime pass. A fresh hidden-set submission is still authoritative for
-this revision.
+earlier `d75e03a` revision measured `15300` points in `261 s`, and `5b922c8`
+measured `15600` points in `248 s` on the current contest server. These online
+measurements are the runtime baseline, rather than historical public reports
+from a different evaluator. Rank-8 refinement retains about `95.5%` of the
+previous Hessian-lite public Linear improvement while reducing the full local
+self-check time by about `10.6%`. A fresh hidden-set submission is still
+authoritative for this revision.
 
 ## Run the proxy benchmark
 

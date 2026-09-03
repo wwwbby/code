@@ -75,6 +75,8 @@ _HESSIAN_DAMPING = 0.01
 _HESSIAN_SWEEP_ROUNDS = 2
 _HESSIAN_CHUNK_BLOCKS = 8192
 _HESSIAN_MIN_REPLACE_IMPROVEMENT = 0.01
+_HESSIAN_LOW_RANK = 8
+_HESSIAN_LOW_RANK_SWEEPS = 1
 
 
 # =============================================================================
@@ -646,6 +648,22 @@ def _build_block_hessian_reg(
     return hessian / normalization[:, None, None] + _HESSIAN_DAMPING * eye
 
 
+def _factor_low_rank_hessian(
+    hessian_reg: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return an exact diagonal plus a rank-r covariance correction."""
+
+    eigenvalues, eigenvectors = torch.linalg.eigh(hessian_reg)
+    values = eigenvalues[:, -_HESSIAN_LOW_RANK:].clamp_min(0.0)
+    vectors = eigenvectors[:, :, -_HESSIAN_LOW_RANK:]
+    factors = vectors * values.sqrt()[:, None, :]
+    residual_diagonal = (
+        torch.diagonal(hessian_reg, dim1=-2, dim2=-1)
+        - factors.square().sum(dim=-1)
+    ).clamp_min(_HESSIAN_DAMPING)
+    return residual_diagonal.contiguous(), factors.contiguous()
+
+
 def _materialize_hif4_values(
     values: torch.Tensor,
     abs_values: torch.Tensor,
@@ -1084,6 +1102,145 @@ def _quantize_hif4_hessian_lite(
     }
 
 
+def _quantize_hif4_low_rank_hessian(
+    values: torch.Tensor,
+    hessian_reg: torch.Tensor,
+    baseline: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Refine local scales under an exact-diagonal plus rank-r Hessian."""
+
+    rows, channels = values.shape
+    block_count = channels // _HIF4_BLOCK_SIZE
+    total_blocks = rows * block_count
+    block_values = values.reshape(rows, block_count, 64).reshape(-1, 64)
+    block_index = torch.arange(total_blocks, device=values.device) % block_count
+    diagonal, factors = _factor_low_rank_hessian(hessian_reg)
+    flat_baseline = {
+        key: tensor.reshape(total_blocks, *tensor.shape[2:])
+        for key, tensor in baseline.items()
+    }
+    baseline_values = (
+        flat_baseline["sign"]
+        * flat_baseline["mant"]
+        * flat_baseline["scale_lv2"]
+        * flat_baseline["scale_lv3"]
+        * flat_baseline["scale_factor"]
+    ).reshape(total_blocks, 64)
+    output = {key: tensor.clone() for key, tensor in flat_baseline.items()}
+    lv2_options, lv3_options, _ = _local_scale_options(values.device)
+
+    for start in range(0, total_blocks, _HESSIAN_CHUNK_BLOCKS):
+        end = min(start + _HESSIAN_CHUNK_BLOCKS, total_blocks)
+        batch = block_values[start:end]
+        batch_size = end - start
+        batch_diagonal = diagonal[block_index[start:end]]
+        batch_factors = factors[block_index[start:end]]
+        reconstructed = baseline_values[start:end].clone()
+        error = batch - reconstructed
+        projected_error = torch.bmm(
+            error[:, None, :],
+            batch_factors,
+        ).squeeze(1)
+        baseline_loss = (
+            batch_diagonal * error.square()
+        ).sum(dim=-1) + projected_error.square().sum(dim=-1)
+        loss = baseline_loss.clone()
+
+        scale = flat_baseline["scale_factor"][start:end].reshape(batch_size)
+        lv2 = flat_baseline["scale_lv2"][start:end].reshape(batch_size, 8)
+        lv3 = flat_baseline["scale_lv3"][start:end].reshape(batch_size, 8, 2)
+        choices = (
+            (lv2 > 1.0).to(torch.int64) * 4
+            + (lv3[:, :, 0] > 1.0).to(torch.int64) * 2
+            + (lv3[:, :, 1] > 1.0).to(torch.int64)
+        )
+        cache = _combo_cache(batch.abs(), torch.sign(batch), scale)
+
+        for _ in range(_HESSIAN_LOW_RANK_SWEEPS):
+            for group in range(8):
+                group_start = group * 8
+                group_end = group_start + 8
+                combo_values = cache[group][0]
+                delta = (
+                    combo_values
+                    - reconstructed[:, None, group_start:group_end]
+                )
+                group_error = error[:, group_start:group_end]
+                group_diagonal = batch_diagonal[:, group_start:group_end]
+                diagonal_delta = (
+                    group_diagonal[:, None, :]
+                    * (delta.square() - 2.0 * group_error[:, None, :] * delta)
+                ).sum(dim=-1)
+                projected_delta = torch.einsum(
+                    "bci,bir->bcr",
+                    delta,
+                    batch_factors[:, group_start:group_end, :],
+                )
+                low_rank_delta = (
+                    projected_delta.square()
+                    - 2.0 * projected_error[:, None, :] * projected_delta
+                ).sum(dim=-1)
+                delta_loss = diagonal_delta + low_rank_delta
+                candidate = delta_loss.argmin(dim=-1)
+                candidate_delta_loss = delta_loss.gather(
+                    1,
+                    candidate[:, None],
+                ).squeeze(1)
+                chosen = torch.where(
+                    candidate_delta_loss < 0.0,
+                    candidate,
+                    choices[:, group],
+                )
+                chosen_delta = delta.gather(
+                    1,
+                    chosen[:, None, None].expand(-1, 1, 8),
+                ).squeeze(1)
+                chosen_projected_delta = torch.bmm(
+                    chosen_delta[:, None, :],
+                    batch_factors[:, group_start:group_end, :],
+                ).squeeze(1)
+                reconstructed[:, group_start:group_end] += chosen_delta
+                error[:, group_start:group_end] -= chosen_delta
+                projected_error -= chosen_projected_delta
+                loss += delta_loss.gather(1, chosen[:, None]).squeeze(1)
+                choices[:, group] = chosen
+
+        # Recompute the final objective from the materialized error to avoid
+        # letting accumulated floating-point update noise affect the guard.
+        loss = (
+            batch_diagonal * error.square()
+        ).sum(dim=-1) + projected_error.square().sum(dim=-1)
+        _, mantissa, sign, _ = _materialize_hif4_values(
+            batch,
+            batch.abs(),
+            torch.sign(batch),
+            scale,
+            choices,
+        )
+        improved_params = {
+            "scale_factor": scale[:, None, None, None],
+            "scale_lv2": lv2_options[choices][:, :, None, None],
+            "scale_lv3": lv3_options[choices][:, :, :, None],
+            "sign": sign,
+            "mant": mantissa,
+        }
+        use_improved = loss < baseline_loss * (
+            1.0 - _HESSIAN_MIN_REPLACE_IMPROVEMENT
+        )
+        condition = use_improved.reshape(batch_size, 1, 1, 1)
+        for key in output:
+            output[key][start:end] = torch.where(
+                condition,
+                improved_params[key],
+                flat_baseline[key][start:end],
+            )
+
+    return {
+        key: tensor.reshape(rows, block_count, *tensor.shape[1:]).contiguous()
+        for key, tensor in output.items()
+    }
+
+
 def _block_signs64(block_count: int, device: torch.device) -> torch.Tensor:
     """Return deterministic Rademacher signs, one vector per 64D block."""
 
@@ -1342,7 +1499,7 @@ def hif4_calibration_and_quantize_weight(
     activation_second = activation_second.clamp_min(1.0e-8)
 
     baseline_weight_params = _quantize_hif4(transformed_weight, activation_second)
-    weight_params = _quantize_hif4_hessian_lite(
+    weight_params = _quantize_hif4_low_rank_hessian(
         transformed_weight,
         _build_block_hessian_reg(transformed_activations, channels),
         baseline_weight_params,
@@ -1352,7 +1509,7 @@ def hif4_calibration_and_quantize_weight(
     state = _make_state("activation")
     state.update({
         "schema_version": 7,
-        "algorithm": "hif4-fast-fixed-scale-hessian-lite",
+        "algorithm": "hif4-fast-low-rank-hessian",
         "smooth_scale": smooth.detach().cpu().contiguous(),
         "error_weights": activation_importance.detach().cpu().contiguous(),
         "smooth_alpha": _LINEAR_SMOOTH_ALPHA,
