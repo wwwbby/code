@@ -37,11 +37,9 @@ transform inside every attention head. Balanced Q/K groups retain the public
 `0.4375` exponent; when calibration K RMS exceeds Q RMS by more than 2x, the
 exponent falls to `0.25`. This two-regime rule is computed from two dot products
 inside the existing calibration pass and does not add dynamic candidates.
-Calibration builds opposite-side covariance sketches: K guides Q and
-grouped Q guides K. Rank-8 refinement is accepted only after a conservative
-30% proxy-loss improvement and uses two bounded local sweeps. V stays in its
-original basis and uses attention-probability-weighted channel importance with
-a plain-MSE guard.
+Q and K then use the original direct HiF4 search, while V stays on the fast
+direct NVFP4-to-HiF4 path. Attention covariance/Hessian and probability-weighted
+V experiments were removed after `237b142` exceeded the contest time limit.
 
 The paired Linear and Q/K transforms are algebraically cancelling, so they
 preserve the unquantized Linear output and attention logits exactly apart from
@@ -57,13 +55,13 @@ On the organizer's public mini sample:
 - official output-format checks: `22/22` passed;
 - Linear output NMSE cases: `0.00025638`, `0.00031286`, `0.00028422`,
   `0.00031588`, `0.00028812` (mean `0.00029149`);
-- mixed causal/full Attention output NMSE: `0.00461283`;
-- full self-check runtime on the development machine: `26.6 s`.
+- mixed causal/full Attention output NMSE: `0.00470634`;
+- full self-check runtime on the development machine: `22.6 s`.
 
 On three captured `Qwen2.5-0.5B` layers, the adaptive Q/K exponent raises the
-mean full-attention improvement over plain HiF4 from `58.16%` to `71.00%` and
-the causal-attention improvement from `57.26%` to `66.67%`. The public tensor
-has K/Q RMS `1.09`, so it keeps `0.4375` and its output remains unchanged.
+mean full-attention improvement over plain HiF4 from `-2.40%` to `10.83%` and
+the causal-attention improvement from `0.71%` to `22.85%`. The public tensor has
+K/Q RMS `1.09`, so it keeps `0.4375` and remains bitwise equal to `a649209`.
 
 The local-scale solver algebraically reduces eight hierarchy combinations to
 three effective total scales while preserving the original tie breaks. The
@@ -73,10 +71,11 @@ measurements are the runtime baseline, rather than historical public reports
 from a different evaluator. Rank-8 refinement retains about `95.5%` of the
 previous Hessian-lite public Linear improvement while reducing the full local
 self-check time enough to fund covariance-aware Q/K and guarded V refinement.
-The combined Attention additions improve the public proxy by about `1.99%`
-relative to `5b922c8`, while the complete local runtime remains below that
-revision's roughly `27 s`. A fresh hidden-set submission is still authoritative
-for this revision.
+The later `237b142` Attention-Hessian experiment timed out on the contest
+server, so it is not a usable baseline. This revision returns to the measured
+`a649209` performance envelope (`243 s`, `16000` points) and adds only the two
+calibration dot products needed by the adaptive exponent. A fresh hidden-set
+submission is still authoritative for its score and runtime.
 
 ## Run the proxy benchmark
 
