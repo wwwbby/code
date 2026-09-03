@@ -26,10 +26,53 @@ Attention:
 
 from __future__ import annotations
 
-import math
 from typing import Any
 
 import torch
+
+
+_HIF4_MIN_SCALE = 2.0 ** (-48)
+_HIF4_MAX_SCALE = 49152.0
+_HIF4_MAX_LOCAL_SCALE = 4.0
+_HIF4_MAX_MANTISSA = 1.75
+_HIF4_MAX_VALUE = _HIF4_MAX_SCALE * _HIF4_MAX_LOCAL_SCALE * _HIF4_MAX_MANTISSA
+_HIF4_BLOCK_SIZE = 64
+_NVFP4_BLOCK_SIZE = 16
+_SEARCH_CHUNK_BLOCKS = 1024
+_LINEAR_SMOOTH_ALPHA = 0.65
+_ATTENTION_SMOOTH_ALPHA = 0.25
+_SMOOTH_SCALE_MIN = 1.0 / 16.0
+_SMOOTH_SCALE_MAX = 16.0
+
+# The first candidate wins exact ties.  Keep this tuple ordered and stable so
+# that repeated runs produce identical output tensors.
+_GLOBAL_SCALE_MULTIPLIERS = (
+    0.25,
+    0.35,
+    0.50,
+    0.70,
+    0.85,
+    1.00,
+    1.20,
+    1.50,
+    2.00,
+    2.50,
+    3.00,
+    4.00,
+)
+
+# A second, block-local pass around the first-stage winner.  The baseline
+# candidate (1.0) is always present, and a refined choice is materialized only
+# after a meaningful local weighted-error reduction.
+_REFINEMENT_SCALE_MULTIPLIERS = (0.75, 0.875, 1.0, 1.125, 1.25)
+_MIN_REFINEMENT_RELATIVE_IMPROVEMENT = 0.01
+
+# v5: damped 64x64 block-Hessian selection for Linear Weight only.  These
+# constants are frozen by doc/optimization_v5_spec.json.
+_HESSIAN_DAMPING = 0.01
+_HESSIAN_SWEEP_ROUNDS = 2
+_HESSIAN_CHUNK_BLOCKS = 8192
+_HESSIAN_MIN_REPLACE_IMPROVEMENT = 0.01
 
 
 # =============================================================================
@@ -64,542 +107,70 @@ def dequantize_nvfp4(
 def _dequantize_nvfp4_fp32(
     quant_float: torch.Tensor,
     scale_float: torch.Tensor,
-    blk_size: int = 16,
+    blk_size: int = _NVFP4_BLOCK_SIZE,
 ) -> torch.Tensor:
-    """Decode the NVFP4 carrier without avoidable intermediate BF16 rounding."""
+    """Dequantize the public NVFP4 carrier representation in FP32.
+
+    The public helper intentionally returns BF16 for compatibility with the
+    template.  The quantizer itself keeps the intermediate in FP32 so that the
+    second quantization step does not add an avoidable BF16 rounding error.
+    """
+
+    if not isinstance(quant_float, torch.Tensor):
+        raise TypeError("quant_float must be a torch.Tensor")
+    if not isinstance(scale_float, torch.Tensor):
+        raise TypeError("scale_float must be a torch.Tensor")
+    if quant_float.ndim < 1:
+        raise ValueError("quant_float must have at least one dimension")
+
     channels = int(quant_float.shape[-1])
     if channels % blk_size != 0:
         raise ValueError(
             f"last dimension {channels} is not divisible by block size {blk_size}"
         )
 
-    expected = tuple(quant_float.shape[:-1]) + (channels // blk_size,)
-    if tuple(scale_float.shape) != expected:
+    expected_scale_shape = tuple(quant_float.shape[:-1]) + (channels // blk_size,)
+    if tuple(scale_float.shape) != expected_scale_shape:
         raise ValueError(
-            f"scale shape {tuple(scale_float.shape)} does not match {expected}"
+            f"scale shape {tuple(scale_float.shape)} does not match "
+            f"expected {expected_scale_shape}"
         )
-    x = quant_float.detach().to(torch.float32).unflatten(-1, (-1, blk_size))
-    x = x * scale_float.detach().to(device=x.device, dtype=torch.float32).unsqueeze(-1)
+
+    device = quant_float.device
+    quant_fp32 = quant_float.detach().to(device=device, dtype=torch.float32)
+    scale_fp32 = scale_float.detach().to(device=device, dtype=torch.float32)
+    x = quant_fp32.unflatten(-1, (-1, blk_size))
+    x = x * scale_fp32.unsqueeze(-1)
     return x.flatten(-2, -1)
 
 
-# =============================================================================
-# HiF4 demo quantizer
-# =============================================================================
-
-def _build_e6m2_values() -> tuple[float, ...]:
-    """Return all finite positive E6M2 values accepted by the checker."""
-    values: list[float] = []
-    for exponent in range(-48, 16):
-        for mantissa_code in range(4):
-            value = (2.0 ** exponent) * (1.0 + 0.25 * mantissa_code)
-            if value <= 49152.0:  # The remaining top code is NaN.
-                values.append(float(value))
-    return tuple(values)
-
-
-_E6M2_VALUES = _build_e6m2_values()
-_E6M2_TABLE_CPU = torch.tensor(_E6M2_VALUES, dtype=torch.float32)
-_GLOBAL_SCALE_MULTIPLIERS = (
-    0.25,
-    0.35,
-    0.50,
-    0.70,
-    0.85,
-    1.00,
-    1.20,
-    1.50,
-    2.00,
-    2.50,
-    3.00,
-    4.00,
-)
-_REFINEMENT_SCALE_MULTIPLIERS = (0.75, 0.875, 1.0, 1.125, 1.25)
-_MIN_REFINEMENT_IMPROVEMENT = 0.01
-_LINEAR_SMOOTH_ALPHA = 0.65
-_ATTENTION_SMOOTH_ALPHA = 0.25
-_SMOOTH_SCALE_MIN = 1.0 / 16.0
-_SMOOTH_SCALE_MAX = 16.0
-_V_IMPORTANCE_POWER = 0.25
-_V_IMPORTANCE_BLEND = 0.25
-_V_IMPORTANCE_MIN = 0.5
-_V_IMPORTANCE_MAX = 2.0
-_V_MIN_WEIGHTED_IMPROVEMENT = 0.01
-_V_MAX_PLAIN_REGRESSION = 0.0025
-_HESSIAN_DAMPING = 0.01
-_HESSIAN_SWEEP_ROUNDS = 2
-_HESSIAN_CHUNK_BLOCKS = 8192
-_HESSIAN_MIN_IMPROVEMENT = 0.01
-
-
-def _block_signs64(channels: int) -> torch.Tensor:
-    """Build stable per-block Rademacher signs for a 64D Hadamard rotation."""
-    if channels % 64 != 0:
-        raise ValueError(f"channels {channels} is not divisible by 64")
-    block = torch.arange(channels // 64, dtype=torch.int64)[:, None]
-    lane = torch.arange(64, dtype=torch.int64)[None, :]
-    hashed = (lane * 1103515245 + block * 12345 + 0x9E3779B9) & 0x7FFFFFFF
-    return torch.where(((hashed >> 16) & 1) == 0, 1.0, -1.0).reshape(-1)
-
-
-def _smooth_scale(
-    left_abs_max: torch.Tensor,
-    right_abs_max: torch.Tensor,
-    alpha: float,
-) -> torch.Tensor:
-    """Return a bounded reciprocal scale that balances two matmul operands."""
-    left = left_abs_max.to(torch.float32).clamp_min(1.0e-6)
-    right = right_abs_max.to(torch.float32).clamp_min(1.0e-6)
-    scale = left.pow(alpha) / right.pow(1.0 - alpha)
-    return torch.nan_to_num(scale, nan=1.0, posinf=1.0, neginf=1.0).clamp(
-        min=_SMOOTH_SCALE_MIN,
-        max=_SMOOTH_SCALE_MAX,
-    )
-
-
-def _apply_hadamard_rotation(
-    x: torch.Tensor,
-    signs: torch.Tensor,
-    block_size: int,
-) -> torch.Tensor:
-    """Apply the block-diagonal orthogonal transform D @ H to the last axis.
-
-    Small blocks intentionally align with the HiF4 micro-scale tree: H4 stays
-    inside one level-3 group and H8 stays inside one level-2 group.  Applying
-    the same transform to both sides of a matmul leaves the FP32 result intact.
-    """
-    shape = tuple(int(v) for v in x.shape)
-    channels = int(shape[-1])
-    if block_size <= 0 or block_size & (block_size - 1):
-        raise ValueError(f"Hadamard block size must be a power of two, got {block_size}")
-    if channels % block_size != 0:
-        raise ValueError(
-            f"last dimension {channels} is not divisible by rotation block {block_size}"
-        )
-    if signs.numel() != channels:
-        raise ValueError(
-            f"rotation has {signs.numel()} signs, expected {channels}"
-        )
-
-    blocks = x.to(torch.float32).reshape(-1, channels // block_size, block_size)
-    blocks = blocks * signs.to(device=blocks.device, dtype=torch.float32).reshape(
-        1, channels // block_size, block_size
-    )
-
-    stride = 1
-    while stride < block_size:
-        pairs = blocks.reshape(
-            int(blocks.shape[0]),
-            int(blocks.shape[1]),
-            block_size // (2 * stride),
-            2,
-            stride,
-        )
-        left = pairs[..., 0, :]
-        right = pairs[..., 1, :]
-        blocks = torch.cat((left + right, left - right), dim=-1).reshape(
-            int(blocks.shape[0]),
-            int(blocks.shape[1]),
-            block_size,
-        )
-        stride *= 2
-
-    blocks = blocks * (block_size ** -0.5)
-    return blocks.reshape(shape)
-
-
-def _e6m2_table(device: torch.device) -> torch.Tensor:
-    if device.type == "cpu":
-        return _E6M2_TABLE_CPU
-    return _E6M2_TABLE_CPU.to(device=device)
-
-
-def _nearest_e6m2_index(
-    target: torch.Tensor,
-    table: torch.Tensor,
-) -> torch.Tensor:
-    """Find the closest legal finite E6M2 value for each positive target."""
-    target = target.to(torch.float32).clamp(
-        min=float(_E6M2_VALUES[0]),
-        max=float(_E6M2_VALUES[-1]),
-    )
-    hi = torch.searchsorted(table, target).clamp(max=table.numel() - 1)
-    lo = (hi - 1).clamp(min=0)
-    lo_value = table[lo]
-    hi_value = table[hi]
-    return torch.where(target - lo_value <= hi_value - target, lo, hi)
-
-
 def _snap_to_e6m2(value: torch.Tensor) -> torch.Tensor:
-    """Round positive FP32 values onto the checker's finite E6M2 grid."""
+    """Snap positive FP32 values to the exact E6M2 grid used by self_check."""
+
     value = torch.nan_to_num(
         value,
-        nan=float(_E6M2_VALUES[0]),
-        posinf=float(_E6M2_VALUES[-1]),
-        neginf=float(_E6M2_VALUES[0]),
-    ).clamp(min=float(_E6M2_VALUES[0]), max=float(_E6M2_VALUES[-1]))
+        nan=_HIF4_MIN_SCALE,
+        posinf=_HIF4_MAX_SCALE,
+        neginf=_HIF4_MIN_SCALE,
+    ).clamp(min=_HIF4_MIN_SCALE, max=_HIF4_MAX_SCALE)
+
     exponent = torch.floor(torch.log2(value))
     quantum = torch.pow(
         torch.tensor(2.0, dtype=value.dtype, device=value.device),
         exponent - 2.0,
     )
-    return (torch.round(value / quantum) * quantum).clamp(
-        min=float(_E6M2_VALUES[0]),
-        max=float(_E6M2_VALUES[-1]),
-    )
-
-
-def _pack_hif4(
-    original_shape: tuple[int, ...],
-    scale_factor: torch.Tensor,
-    scale_lv2: torch.Tensor,
-    scale_lv3: torch.Tensor,
-    sign: torch.Tensor,
-    mant: torch.Tensor,
-) -> dict[str, torch.Tensor]:
-    channels = int(original_shape[-1])
-    prefix = original_shape[:-1] + (channels // 64,)
-    return {
-        "scale_factor": scale_factor.reshape(prefix + (1, 1, 1)),
-        "scale_lv2": scale_lv2.reshape(prefix + (8, 1, 1)),
-        "scale_lv3": scale_lv3.reshape(prefix + (8, 2, 1)),
-        "sign": sign.reshape(prefix + (8, 2, 4)),
-        "mant": mant.reshape(prefix + (8, 2, 4)),
-    }
-
-
-def _encode_s1p2(
-    blocks: torch.Tensor,
-    scale_factor: torch.Tensor,
-    scale_lv2: torch.Tensor,
-    scale_lv3: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    divisor = (
-        scale_factor[:, None, None, None]
-        * scale_lv2[:, :, None, None]
-        * scale_lv3[:, :, :, None]
-    )
-    scaled = blocks / divisor
-    mant = torch.round(scaled.abs() * 4.0).clamp_(0.0, 7.0) * 0.25
-    sign = torch.sign(scaled)
-    sign = torch.where(mant == 0.0, torch.zeros_like(sign), sign)
-    return sign.to(torch.float32), mant.to(torch.float32)
-
-
-def _quantize_hif4_direct(x: torch.Tensor) -> dict[str, torch.Tensor]:
-    """Paper-style peak-based BF16/FP32 to HiF4 conversion baseline."""
-    original_shape = tuple(int(v) for v in x.shape)
-    channels = int(original_shape[-1])
-    if channels % 64 != 0:
-        raise ValueError(f"last dimension {channels} is not divisible by 64")
-
-    blocks = x.to(torch.float32).reshape(-1, 8, 2, 4)
-    table = _e6m2_table(blocks.device)
-    max4 = blocks.abs().amax(dim=-1)
-    max8 = max4.amax(dim=-1)
-    max64 = max8.amax(dim=-1)
-    sf_index = _nearest_e6m2_index(max64 / 7.0, table)
-    scale_factor = table[sf_index]
-
-    scale_lv2 = torch.where(
-        max8 / scale_factor[:, None] >= 4.0,
-        2.0,
-        1.0,
-    ).to(torch.float32)
-    scale_lv3 = torch.where(
-        max4 / (scale_factor[:, None, None] * scale_lv2[:, :, None]) >= 2.0,
-        2.0,
-        1.0,
-    ).to(torch.float32)
-    sign, mant = _encode_s1p2(
-        blocks,
-        scale_factor,
-        scale_lv2,
-        scale_lv3,
-    )
-    return _pack_hif4(
-        original_shape,
-        scale_factor,
-        scale_lv2,
-        scale_lv3,
-        sign,
-        mant,
-    )
-
-
-def _candidate_loss(
-    blocks: torch.Tensor,
-    candidates: torch.Tensor,
-    importance: torch.Tensor | None,
-) -> torch.Tensor:
-    """Evaluate global scales after exactly optimizing the local scale tree."""
-    totals = torch.tensor([1.0, 2.0, 4.0], device=blocks.device)
-    divisor = (
-        candidates[:, :, None, None, None, None]
-        * totals[None, None, None, None, None, :]
-    )
-    expanded = blocks[:, None, :, :, :, None]
-    mant = torch.round((expanded / divisor).abs() * 4.0).clamp_(0.0, 7.0) * 0.25
-    reconstructed = torch.sign(expanded) * mant * divisor
-    # [block, candidate, eight-group, four-group, total-scale]
-    squared_error = (reconstructed - expanded).square()
-    if importance is not None:
-        squared_error = squared_error * importance[:, None, :, :, :, None]
-    loss = squared_error.sum(dim=4)
-
-    l2_one_cost = loss[..., 0:2].amin(dim=-1).sum(dim=-1)
-    l2_two_cost = loss[..., 1:3].amin(dim=-1).sum(dim=-1)
-    return torch.minimum(l2_one_cost, l2_two_cost).sum(dim=-1)
-
-
-def _search_chunk(
-    blocks: torch.Tensor,
-    importance: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Minimize weighted SSE with broad and guarded refined E6M2 search."""
-    peak = blocks.abs().amax(dim=(1, 2, 3))
-    multipliers = torch.tensor(
-        _GLOBAL_SCALE_MULTIPLIERS,
-        dtype=torch.float32,
-        device=blocks.device,
-    )
-    candidates = _snap_to_e6m2((peak / 7.0)[:, None] * multipliers[None, :])
-    candidate_cost = _candidate_loss(blocks, candidates, importance)
-    best_candidate = candidate_cost.argmin(dim=-1)
-    row_index = torch.arange(int(blocks.shape[0]), device=blocks.device)
-    baseline_scale = candidates[row_index, best_candidate]
-    baseline_cost = candidate_cost[row_index, best_candidate]
-
-    refinement = torch.tensor(
-        _REFINEMENT_SCALE_MULTIPLIERS,
-        dtype=torch.float32,
-        device=blocks.device,
-    )
-    refined_candidates = _snap_to_e6m2(
-        baseline_scale[:, None] * refinement[None, :]
-    )
-    refined_cost = _candidate_loss(blocks, refined_candidates, importance)
-    best_refined = refined_cost.argmin(dim=-1)
-    refined_scale = refined_candidates[row_index, best_refined]
-    best_refined_cost = refined_cost[row_index, best_refined]
-    use_refined = best_refined_cost < baseline_cost * (
-        1.0 - _MIN_REFINEMENT_IMPROVEMENT
-    )
-    scale_factor = torch.where(use_refined, refined_scale, baseline_scale)
-
-    totals = torch.tensor([1.0, 2.0, 4.0], device=blocks.device)
-    chosen_divisor = (
-        scale_factor[:, None, None, None, None]
-        * totals[None, None, None, None, :]
-    )
-    expanded = blocks[:, :, :, :, None]
-    mant = torch.round((expanded / chosen_divisor).abs() * 4.0).clamp_(0.0, 7.0) * 0.25
-    reconstructed = torch.sign(expanded) * mant * chosen_divisor
-    squared_error = (reconstructed - expanded).square()
-    if importance is not None:
-        squared_error = squared_error * importance[:, :, :, :, None]
-    loss = squared_error.sum(dim=3)
-
-    l2_one_cost = loss[..., 0:2].amin(dim=-1).sum(dim=-1)
-    l2_two_cost = loss[..., 1:3].amin(dim=-1).sum(dim=-1)
-    use_l2_two = l2_two_cost < l2_one_cost
-    scale_lv2 = torch.where(use_l2_two, 2.0, 1.0).to(torch.float32)
-
-    lv3_if_l2_one = torch.where(loss[..., 1] < loss[..., 0], 2.0, 1.0)
-    lv3_if_l2_two = torch.where(loss[..., 2] < loss[..., 1], 2.0, 1.0)
-    scale_lv3 = torch.where(
-        use_l2_two[:, :, None],
-        lv3_if_l2_two,
-        lv3_if_l2_one,
-    ).to(torch.float32)
-
-    sign, mant = _encode_s1p2(
-        blocks,
-        scale_factor,
-        scale_lv2,
-        scale_lv3,
-    )
-    return scale_factor, scale_lv2, scale_lv3, sign, mant
-
-
-def _quantize_hif4_search(
-    x: torch.Tensor,
-    chunk_blocks: int = 1024,
-    importance: torch.Tensor | None = None,
-) -> dict[str, torch.Tensor]:
-    """Search legal global and local scales with an optional weighted loss."""
-    original_shape = tuple(int(v) for v in x.shape)
-    channels = int(original_shape[-1])
-    if channels % 64 != 0:
-        raise ValueError(f"last dimension {channels} is not divisible by 64")
-
-    blocks = x.to(torch.float32).reshape(-1, 8, 2, 4)
-    importance_blocks = None
-    if importance is not None:
-        importance = importance.to(device=blocks.device, dtype=torch.float32)
-        importance = torch.broadcast_to(importance, original_shape)
-        importance_blocks = importance.reshape(-1, 8, 2, 4)
-    outputs: list[list[torch.Tensor]] = [[], [], [], [], []]
-    for start in range(0, int(blocks.shape[0]), chunk_blocks):
-        chunk_importance = None
-        if importance_blocks is not None:
-            chunk_importance = importance_blocks[start:start + chunk_blocks]
-        result = _search_chunk(
-            blocks[start:start + chunk_blocks],
-            chunk_importance,
-        )
-        for bucket, value in zip(outputs, result):
-            bucket.append(value)
-
-    scale_factor, scale_lv2, scale_lv3, sign, mant = [
-        torch.cat(parts, dim=0) for parts in outputs
-    ]
-    return _pack_hif4(
-        original_shape,
-        scale_factor,
-        scale_lv2,
-        scale_lv3,
-        sign,
-        mant,
-    )
-
-
-def _attention_pair_scales(
-    calib_qkv_list: list,
-    q_num_heads: int,
-    kv_num_heads: int,
-    head_dim: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Balance Q/K RMS with an exactly cancelling per-dimension transform."""
-    q_per_kv = q_num_heads // kv_num_heads
-    q_energy = torch.zeros((kv_num_heads, head_dim), dtype=torch.float64)
-    k_energy = torch.zeros((kv_num_heads, head_dim), dtype=torch.float64)
-    q_count = 0
-    k_count = 0
-    for sample in calib_qkv_list:
-        q = dequantize_nvfp4(*sample["q"]).to(torch.float32)
-        k = dequantize_nvfp4(*sample["k"]).to(torch.float32)
-        q = q.reshape(-1, kv_num_heads, q_per_kv, head_dim)
-        k = k.reshape(-1, kv_num_heads, head_dim)
-        q_energy += q.to(torch.float64).square().sum(dim=(0, 2)).cpu()
-        k_energy += k.to(torch.float64).square().sum(dim=0).cpu()
-        q_count += int(q.shape[0]) * q_per_kv
-        k_count += int(k.shape[0])
-
-    eps = torch.finfo(torch.float32).tiny
-    q_rms = (q_energy / max(q_count, 1)).sqrt().to(torch.float32)
-    k_rms = (k_energy / max(k_count, 1)).sqrt().to(torch.float32)
-    pair_scale = torch.sqrt(
-        q_rms.clamp_min(eps) / k_rms.clamp_min(eps)
-    ).clamp(min=0.25, max=4.0)
-    # A single conservative factor generalizes better than noisy per-dimension
-    # calibration while still preserving QK^T exactly before quantization.
-    global_scale = torch.exp(torch.log(pair_scale).mean() * 0.5).clamp(
-        min=0.5,
-        max=2.0,
-    )
-    # Tiny scale changes can move values across discrete S1P2 boundaries without
-    # representing a real Q/K imbalance. Keep identity inside a 5% dead band.
-    if abs(float(torch.log(global_scale).item())) < math.log(1.05):
-        global_scale = torch.ones_like(global_scale)
-    pair_scale = torch.ones_like(pair_scale) * global_scale
-    q_scale = pair_scale.repeat_interleave(q_per_kv, dim=0).reshape(-1)
-    k_scale = pair_scale.reshape(-1)
-    return q_scale.contiguous(), k_scale.contiguous()
-
-
-def _attention_weighted_v_energy(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    q_num_heads: int,
-    kv_num_heads: int,
-    head_dim: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Estimate each V channel's contribution under full and causal attention."""
-    q_length = int(q.shape[0])
-    key_length = int(k.shape[0])
-    if q_length <= 256:
-        positions = torch.arange(q_length, device=q.device)
-    else:
-        positions = torch.linspace(
-            0,
-            q_length - 1,
-            steps=256,
-            device=q.device,
-        ).round().to(torch.int64)
-    q_heads = q.reshape(q_length, q_num_heads, head_dim).permute(1, 0, 2)
-    k_heads = k.reshape(key_length, kv_num_heads, head_dim).permute(1, 0, 2)
-    v_energy = v.reshape(key_length, kv_num_heads, head_dim).permute(1, 0, 2).square()
-    key_positions = torch.arange(key_length, device=q.device)
-    q_per_kv = q_num_heads // kv_num_heads
-    energy = torch.zeros((kv_num_heads, head_dim), device=q.device)
-    usage_total = torch.zeros((kv_num_heads, 1), device=q.device)
-
-    for kv_head in range(kv_num_heads):
-        queries = q_heads[kv_head * q_per_kv:(kv_head + 1) * q_per_kv]
-        key = k_heads[kv_head]
-        for start in range(0, int(positions.numel()), 64):
-            selected = positions[start:start + 64]
-            logits = torch.matmul(
-                queries[:, selected].float(),
-                key.float().transpose(0, 1),
-            ) / math.sqrt(float(head_dim))
-            full_usage = torch.softmax(logits, dim=-1).square().sum(dim=(0, 1))
-            if q_length == key_length:
-                causal_limit = selected
-            elif q_length == 1:
-                causal_limit = torch.zeros_like(selected)
-            else:
-                causal_limit = torch.round(
-                    selected.float() * float(key_length - 1) / float(q_length - 1)
-                ).to(torch.int64)
-            mask = key_positions[None, :] <= causal_limit[:, None]
-            causal_usage = torch.softmax(
-                logits.masked_fill(~mask[None], float("-inf")),
-                dim=-1,
-            ).square().sum(dim=(0, 1))
-            usage = 0.5 * (full_usage + causal_usage)
-            energy[kv_head] += (usage[:, None] * v_energy[kv_head]).sum(dim=0)
-            usage_total[kv_head] += usage.sum()
-    return energy, usage_total
-
-
-def _finalize_v_importance(
-    weighted_energy: torch.Tensor,
-    usage_total: torch.Tensor,
-) -> torch.Tensor:
-    relative = weighted_energy / usage_total.clamp_min(1.0e-8)
-    median = relative.median(dim=-1, keepdim=True).values
-    compressed = (relative / (median + 1.0e-8)).clamp_min(0.0).pow(
-        _V_IMPORTANCE_POWER
-    ).clamp(min=_V_IMPORTANCE_MIN, max=_V_IMPORTANCE_MAX)
-    importance = (1.0 - _V_IMPORTANCE_BLEND) + _V_IMPORTANCE_BLEND * compressed
-    importance = torch.nan_to_num(importance, nan=1.0, posinf=1.0, neginf=1.0)
-    blocks = importance.reshape(-1, 64)
-    blocks = blocks / blocks.mean(dim=-1, keepdim=True).clamp_min(1.0e-8)
-    return blocks.reshape_as(importance).cpu().contiguous()
-
-
-def _reconstruct_hif4(
-    params: dict[str, torch.Tensor],
-    reference: torch.Tensor,
-) -> torch.Tensor:
-    return (
-        params["sign"]
-        * params["mant"]
-        * params["scale_lv2"]
-        * params["scale_lv3"]
-        * params["scale_factor"]
-    ).reshape_as(reference)
+    snapped = torch.round(value / quantum) * quantum
+    return snapped.clamp(min=_HIF4_MIN_SCALE, max=_HIF4_MAX_SCALE)
 
 
 def _local_scale_options(
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Enumerate the eight legal (level-2, left-level-3, right-level-3) choices."""
+    """Return all 8 legal (lv2, lv3-left, lv3-right) combinations."""
+
     lv2 = torch.tensor(
         [1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0],
+        dtype=torch.float32,
         device=device,
     )
     lv3 = torch.tensor(
@@ -613,138 +184,408 @@ def _local_scale_options(
             [2.0, 1.0],
             [2.0, 2.0],
         ],
+        dtype=torch.float32,
         device=device,
     )
-    return lv2, lv3, lv2[:, None] * lv3
+    return lv2, lv3, lv2.unsqueeze(-1) * lv3
 
 
-def _evaluate_scale_candidates(
-    abs_blocks: torch.Tensor,
+def _evaluate_hif4_scale_candidates(
+    abs_block: torch.Tensor,
     candidate_scales: torch.Tensor,
-    importance: torch.Tensor | None,
+    local_scale_options: torch.Tensor,
+    weight_block: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return weighted errors and local-scale choices for global candidates."""
-    _, _, local = _local_scale_options(abs_blocks.device)
-    values = abs_blocks[:, None, :, None, :, :]
-    divisors = (
-        candidate_scales[:, :, None, None, None, None]
-        * local[None, None, None, :, :, None]
+    """Return total errors and local exponent choices for global scales."""
+
+    # values       [block, candidate, lv2-group, option, lv3-group, value]
+    # local scales [1,     1,         1,         option, lv3-group, 1]
+    values = abs_block[:, None, :, None, :, :]
+    global_scales = candidate_scales[:, :, None, None, None, None]
+    local_scales = local_scale_options[None, None, None, :, :, None]
+    total_scales = global_scales * local_scales
+
+    candidate_mant = torch.round(values / total_scales * 4.0) * 0.25
+    candidate_mant = candidate_mant.clamp(
+        min=0.0,
+        max=_HIF4_MAX_MANTISSA,
     )
-    mant = (torch.round(values / divisors * 4.0) * 0.25).clamp(0.0, 1.75)
-    error = (values - mant * divisors).square()
-    if importance is not None:
-        error = error * importance[:, None, :, None, :, :]
-    error = error.sum(dim=(-1, -2))
-    local_error, local_choice = error.min(dim=-1)
+    reconstructed = candidate_mant * total_scales
+    element_error = (values - reconstructed).square()
+    if weight_block is not None:
+        element_error = element_error * weight_block[:, None, :, None, :, :]
+    squared_error = element_error.sum(dim=(-1, -2))
+
+    # Each 8-value group independently chooses one of the 8 legal local
+    # exponent combinations.  Their errors then sum for the 64-value block.
+    local_error, local_choice = squared_error.min(dim=-1)
     return local_error.sum(dim=-1), local_choice
 
 
-def _build_block_hessian(
+def _quantize_hif4(
+    x: torch.Tensor,
+    error_weights: torch.Tensor | None = None,
+    enable_refinement: bool = True,
+) -> dict[str, torch.Tensor]:
+    """Quantize FP32 values with guarded two-stage weighted MSE search."""
+
+    if not isinstance(x, torch.Tensor):
+        raise TypeError("x must be a torch.Tensor")
+    if x.ndim < 1:
+        raise ValueError("x must have at least one dimension")
+    if type(enable_refinement) is not bool:
+        raise TypeError("enable_refinement must be a bool")
+
+    channels = int(x.shape[-1])
+    if channels % _HIF4_BLOCK_SIZE != 0:
+        raise ValueError(
+            f"last dimension {channels} is not divisible by HiF4 block size "
+            f"{_HIF4_BLOCK_SIZE}"
+        )
+
+    x_fp32 = x.detach().to(dtype=torch.float32)
+    x_fp32 = torch.nan_to_num(
+        x_fp32,
+        nan=0.0,
+        posinf=_HIF4_MAX_VALUE,
+        neginf=-_HIF4_MAX_VALUE,
+    ).clamp(min=-_HIF4_MAX_VALUE, max=_HIF4_MAX_VALUE)
+
+    weight_blocks: torch.Tensor | None = None
+    if error_weights is not None:
+        if not isinstance(error_weights, torch.Tensor):
+            raise TypeError("error_weights must be a torch.Tensor or None")
+        weights = error_weights.detach().to(device=x_fp32.device, dtype=torch.float32)
+        try:
+            weights = torch.broadcast_to(weights, x_fp32.shape)
+        except RuntimeError as exc:
+            raise ValueError(
+                f"error_weights shape {tuple(error_weights.shape)} cannot broadcast "
+                f"to input shape {tuple(x_fp32.shape)}"
+            ) from exc
+        if (weights < 0.0).any():
+            raise ValueError("error_weights must be non-negative")
+        weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
+        weights = weights / weights.mean().clamp_min(1.0e-12)
+        weight_blocks = weights.reshape(-1, 8, 2, 4)
+
+    prefix = tuple(int(size) for size in x_fp32.shape[:-1])
+    block_count_per_row = channels // _HIF4_BLOCK_SIZE
+    blocks = x_fp32.reshape(-1, 8, 2, 4)
+    total_blocks = int(blocks.shape[0])
+    device = x_fp32.device
+
+    scale_factor_out = torch.empty(
+        (total_blocks, 1, 1, 1), dtype=torch.float32, device=device
+    )
+    scale_lv2_out = torch.empty(
+        (total_blocks, 8, 1, 1), dtype=torch.float32, device=device
+    )
+    scale_lv3_out = torch.empty(
+        (total_blocks, 8, 2, 1), dtype=torch.float32, device=device
+    )
+    sign_out = torch.empty(
+        (total_blocks, 8, 2, 4), dtype=torch.float32, device=device
+    )
+    mant_out = torch.empty_like(sign_out)
+
+    multipliers = torch.tensor(
+        _GLOBAL_SCALE_MULTIPLIERS,
+        dtype=torch.float32,
+        device=device,
+    )
+    refinement_multipliers = torch.tensor(
+        _REFINEMENT_SCALE_MULTIPLIERS,
+        dtype=torch.float32,
+        device=device,
+    )
+    lv2_options, lv3_options, local_scale_options = _local_scale_options(device)
+
+    for start in range(0, total_blocks, _SEARCH_CHUNK_BLOCKS):
+        end = min(start + _SEARCH_CHUNK_BLOCKS, total_blocks)
+        block = blocks[start:end]
+        abs_block = block.abs()
+
+        # The largest representable local factor is 2 * 2 * 1.75 = 7.
+        base_scale = abs_block.amax(dim=(1, 2, 3)) / 7.0
+        candidate_scales = _snap_to_e6m2(
+            base_scale.unsqueeze(-1) * multipliers.unsqueeze(0)
+        )
+        weight_block = None if weight_blocks is None else weight_blocks[start:end]
+        global_error, local_choice = _evaluate_hif4_scale_candidates(
+            abs_block,
+            candidate_scales,
+            local_scale_options,
+            weight_block,
+        )
+        global_choice = global_error.argmin(dim=-1)
+
+        row_index = torch.arange(end - start, device=device)
+        baseline_scale = candidate_scales[row_index, global_choice]
+        baseline_error = global_error[row_index, global_choice]
+        baseline_local = local_choice.gather(
+            1,
+            global_choice[:, None, None].expand(-1, 1, 8),
+        ).squeeze(1)
+        chosen_scale = baseline_scale
+        chosen_local = baseline_local
+
+        if enable_refinement:
+            refined_scales = _snap_to_e6m2(
+                baseline_scale.unsqueeze(-1)
+                * refinement_multipliers.unsqueeze(0)
+            )
+            refined_error, refined_local_choice = (
+                _evaluate_hif4_scale_candidates(
+                    abs_block,
+                    refined_scales,
+                    local_scale_options,
+                    weight_block,
+                )
+            )
+            refined_global_choice = refined_error.argmin(dim=-1)
+            best_refined_error = refined_error[
+                row_index,
+                refined_global_choice,
+            ]
+            best_refined_scale = refined_scales[
+                row_index,
+                refined_global_choice,
+            ]
+            best_refined_local = refined_local_choice.gather(
+                1,
+                refined_global_choice[:, None, None].expand(-1, 1, 8),
+            ).squeeze(1)
+            use_refinement = best_refined_error < baseline_error * (
+                1.0 - _MIN_REFINEMENT_RELATIVE_IMPROVEMENT
+            )
+            chosen_scale = torch.where(
+                use_refinement,
+                best_refined_scale,
+                baseline_scale,
+            )
+            chosen_local = torch.where(
+                use_refinement[:, None],
+                best_refined_local,
+                baseline_local,
+            )
+
+        chosen_lv2 = lv2_options[chosen_local]
+        chosen_lv3 = lv3_options[chosen_local]
+        chosen_total_scale = (
+            chosen_scale[:, None, None, None]
+            * chosen_lv2[:, :, None, None]
+            * chosen_lv3[:, :, :, None]
+        )
+
+        chosen_mant = torch.round(abs_block / chosen_total_scale * 4.0) * 0.25
+        chosen_mant = chosen_mant.clamp(min=0.0, max=_HIF4_MAX_MANTISSA)
+        chosen_sign = torch.sign(block)
+        chosen_sign = torch.where(
+            chosen_mant == 0.0,
+            torch.zeros((), dtype=torch.float32, device=device),
+            chosen_sign,
+        )
+
+        scale_factor_out[start:end, 0, 0, 0] = chosen_scale
+        scale_lv2_out[start:end, :, 0, 0] = chosen_lv2
+        scale_lv3_out[start:end, :, :, 0] = chosen_lv3
+        sign_out[start:end] = chosen_sign
+        mant_out[start:end] = chosen_mant
+
+    return {
+        "scale_factor": scale_factor_out.reshape(
+            prefix + (block_count_per_row, 1, 1, 1)
+        ).contiguous(),
+        "scale_lv2": scale_lv2_out.reshape(
+            prefix + (block_count_per_row, 8, 1, 1)
+        ).contiguous(),
+        "scale_lv3": scale_lv3_out.reshape(
+            prefix + (block_count_per_row, 8, 2, 1)
+        ).contiguous(),
+        "sign": sign_out.reshape(
+            prefix + (block_count_per_row, 8, 2, 4)
+        ).contiguous(),
+        "mant": mant_out.reshape(
+            prefix + (block_count_per_row, 8, 2, 4)
+        ).contiguous(),
+    }
+
+
+def _quantize_nvfp4_pair(
+    quant_float: torch.Tensor,
+    scale_float: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    return _quantize_hif4(
+        _dequantize_nvfp4_fp32(quant_float, scale_float, _NVFP4_BLOCK_SIZE)
+    )
+
+
+# =============================================================================
+# v5: damped block-Hessian Linear Weight search
+# =============================================================================
+#
+# The v4 diagonal second-moment objective sum_i H_ii (w_i - w_hat_i)^2 is
+# upgraded to e^T H_reg e per 64-input-channel block, where
+#
+#     H       = A_block^T A_block / max(sample_count, 1)
+#     d       = max(trace(H) / 64, 1e-8)
+#     H_reg   = H / d + 0.01 * I
+#
+# A is the calibration activation after the same Smooth and signed Hadamard
+# transforms used by v4.  The scale candidate universe and every non-Weight
+# numerical path stay exactly as in v4; only the selection objective changes.
+# The Hessian is a temporary calibration value and never enters any state.
+
+def _build_block_hessian_reg(
     transformed_activations: list[torch.Tensor],
     channels: int,
 ) -> torch.Tensor:
-    """Build a normalized, damped 64D covariance for each input block."""
+    """Build the per-block normalized damped 64x64 calibration Hessian."""
+
+    if channels % _HIF4_BLOCK_SIZE != 0:
+        raise ValueError("Hessian input channels must be divisible by 64")
     rows = torch.cat(
-        [value.reshape(-1, channels) for value in transformed_activations],
+        [t.reshape(-1, channels) for t in transformed_activations],
         dim=0,
     )
-    block_count = channels // 64
-    stacked = rows.reshape(-1, block_count, 64)
-    hessian = torch.einsum("nbx,nby->bxy", stacked, stacked) / max(
-        int(rows.shape[0]),
-        1,
-    )
-    trace = torch.diagonal(hessian, dim1=-2, dim2=-1).sum(dim=-1)
-    normalization = (trace / 64.0).clamp_min(1.0e-8)
-    eye = torch.eye(64, dtype=torch.float32, device=rows.device)[None]
+    block_count = channels // _HIF4_BLOCK_SIZE
+    sample_count = max(int(rows.shape[0]), 1)
+    stacked = rows.reshape(-1, block_count, _HIF4_BLOCK_SIZE)
+    hessian = torch.einsum("nbx,nby->bxy", stacked, stacked) / sample_count
+    trace = torch.diagonal(hessian, dim1=-2, dim2=-1).sum(-1)
+    normalization = (trace / float(_HIF4_BLOCK_SIZE)).clamp_min(1.0e-8)
+    eye = torch.eye(_HIF4_BLOCK_SIZE, dtype=torch.float32)[None]
     return hessian / normalization[:, None, None] + _HESSIAN_DAMPING * eye
 
 
-def _materialize_block_choice(
+def _materialize_hif4_values(
     values: torch.Tensor,
+    abs_values: torch.Tensor,
+    sign_values: torch.Tensor,
     global_scale: torch.Tensor,
-    local_choice: torch.Tensor,
-) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Decode one selected global/local scale assignment for 64D blocks."""
-    lv2, lv3, local = _local_scale_options(values.device)
-    total = global_scale[:, None, None, None] * local[local_choice][:, :, :, None]
-    blocks = values.reshape(-1, 8, 2, 4)
-    mant = (torch.round(blocks.abs() / total * 4.0) * 0.25).clamp(0.0, 1.75)
-    sign = torch.where(mant == 0.0, 0.0, torch.sign(blocks))
-    reconstructed = (sign * mant * total).reshape(-1, 64)
-    params = {
-        "scale_factor": global_scale[:, None, None, None],
-        "scale_lv2": lv2[local_choice][:, :, None, None],
-        "scale_lv3": lv3[local_choice][:, :, :, None],
-        "sign": sign,
-        "mant": mant,
-    }
-    return reconstructed, params
+    local_choices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Materialize reconstructed values, mantissa, sign and local scales."""
+
+    _, _, local_scale_options = _local_scale_options(values.device)
+    row_count = int(values.shape[0])
+    t = local_scale_options[local_choices]                       # (B, 8, 2)
+    total = global_scale[:, None, None, None] * t[:, :, :, None]  # (B, 8, 2, 4)
+    abs_block = abs_values.view(row_count, 8, 2, 4)
+    mantissa = (torch.round(abs_block / total * 4.0) * 0.25).clamp(
+        min=0.0,
+        max=_HIF4_MAX_MANTISSA,
+    )
+    sign_block = sign_values.view(row_count, 8, 2, 4)
+    sign = torch.where(
+        mantissa == 0.0,
+        torch.zeros((), dtype=torch.float32, device=values.device),
+        sign_block,
+    )
+    reconstructed = (sign * mantissa * total).reshape(row_count, 64)
+    return reconstructed, mantissa, sign, t
 
 
-def _group_reconstruction_cache(
-    values: torch.Tensor,
+def _combo_cache(
+    abs_values: torch.Tensor,
+    sign_values: torch.Tensor,
     global_scale: torch.Tensor,
-) -> list[torch.Tensor]:
-    """Precompute all eight local reconstructions for every 8-value group."""
-    _, _, local = _local_scale_options(values.device)
-    abs_values = values.abs()
-    signs = torch.sign(values)
-    caches: list[torch.Tensor] = []
+) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Cache the 8 reconstructed combo vectors per 8-value group.
+
+    The vectors depend only on the global scale and the group values, so both
+    coordinate-sweep rounds reuse the same cache.
+    """
+
+    row_count = int(abs_values.shape[0])
+    _, _, local_scale_options = _local_scale_options(abs_values.device)
+    inverse_four_t = 4.0 / local_scale_options                  # (8, 2)
+    scaled_abs = abs_values / global_scale[:, None]             # (B, 64)
+    scaled_total = global_scale[:, None, None] * local_scale_options[None]
+    cache: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
     for group in range(8):
-        piece = abs_values[:, group * 8:(group + 1) * 8].reshape(-1, 2, 4)
-        divisor = global_scale[:, None, None, None] * local[None, :, :, None]
-        mant = (torch.round(piece[:, None] / divisor * 4.0) * 0.25).clamp(
-            0.0,
-            1.75,
+        start = group * 8
+        group_abs = scaled_abs[:, start:start + 8].view(row_count, 2, 4)
+        group_sign = sign_values[:, start:start + 8].view(row_count, 2, 4)
+        mantissa = (
+            torch.round(
+                group_abs[:, None, :, :] * inverse_four_t[None, :, :, None]
+            )
+            * 0.25
+        ).clamp(min=0.0, max=_HIF4_MAX_MANTISSA)
+        sign = torch.where(
+            mantissa == 0.0,
+            torch.zeros((), dtype=torch.float32, device=abs_values.device),
+            group_sign[:, None, :, :],
         )
-        group_sign = signs[:, group * 8:(group + 1) * 8].reshape(-1, 1, 2, 4)
-        group_sign = torch.where(mant == 0.0, 0.0, group_sign)
-        caches.append((group_sign * mant * divisor).reshape(-1, 8, 8))
-    return caches
+        combo_values = (sign * mantissa * scaled_total[:, :, :, None]).reshape(
+            row_count,
+            8,
+            8,
+        )
+        cache.append((combo_values, mantissa, sign))
+    return cache
 
 
-def _hessian_loss(
+def _block_hessian_loss(
     error: torch.Tensor,
     hessian: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return e^T H e and H e per block for the given error vectors."""
+
     hessian_error = torch.bmm(error[:, None, :], hessian).squeeze(1)
-    return (hessian_error * error).sum(dim=-1), hessian_error
+    return (hessian_error * error).sum(-1), hessian_error
 
 
-def _sweep_hessian_local_scales(
+def _sweep_local_scales(
     values: torch.Tensor,
+    abs_values: torch.Tensor,
+    sign_values: torch.Tensor,
     global_scale: torch.Tensor,
-    initial_choice: torch.Tensor,
+    init_choices: torch.Tensor,
     hessian: torch.Tensor,
+    group_hessians: list[torch.Tensor],
+    hessian_columns: list[torch.Tensor],
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
-    """Run deterministic coordinate descent over the eight local scale groups."""
-    choices = initial_choice.clone()
-    reconstructed, _ = _materialize_block_choice(values, global_scale, choices)
+    """Two rounds of per-group coordinate descent under the block Hessian."""
+
+    row_count = int(values.shape[0])
+    choices = init_choices.clone()
+    reconstructed, _, _, _ = _materialize_hif4_values(
+        values,
+        abs_values,
+        sign_values,
+        global_scale,
+        choices,
+    )
     error = values - reconstructed
-    loss, hessian_error = _hessian_loss(error, hessian)
-    changes = torch.zeros(int(values.shape[0]), dtype=torch.int64, device=values.device)
-    caches = _group_reconstruction_cache(values, global_scale)
+    loss, hessian_error = _block_hessian_loss(error, hessian)
+    changes = torch.zeros(row_count, dtype=torch.int64, device=values.device)
+    cache = _combo_cache(abs_values, sign_values, global_scale)
 
     for _ in range(_HESSIAN_SWEEP_ROUNDS):
         for group in range(8):
             start = group * 8
-            old_reconstruction = reconstructed[:, start:start + 8]
-            old_error = error[:, start:start + 8]
-            delta = caches[group] - old_reconstruction[:, None, :]
-            diagonal_hessian = hessian[:, start:start + 8, start:start + 8]
-            quadratic = (delta @ diagonal_hessian.transpose(-1, -2) * delta).sum(
-                dim=-1
-            )
-            linear = 2.0 * (
-                delta * hessian_error[:, None, start:start + 8]
-            ).sum(dim=-1)
-            delta_loss = quadratic - linear
-            best_choice = delta_loss.argmin(dim=-1)
-            best_delta_loss = delta_loss.gather(1, best_choice[:, None]).squeeze(1)
+            group_reconstructed = reconstructed[:, start:start + 8]
+            group_error = error[:, start:start + 8]
+            group_he = hessian_error[:, start:start + 8]
+            combo_values, _, _ = cache[group]
+
+            delta = combo_values - group_reconstructed[:, None, :]
+            hessian_delta = (
+                delta @ group_hessians[group].transpose(-1, -2) * delta
+            ).sum(-1)
+            error_delta = 2.0 * (delta * group_he[:, None, :]).sum(-1)
+            delta_loss = hessian_delta - error_delta
+            combo_index = delta_loss.argmin(-1)
+            chosen_delta_loss = delta_loss.gather(
+                1,
+                combo_index[:, None],
+            ).squeeze(1)
             chosen = torch.where(
-                best_delta_loss < 0.0,
-                best_choice,
+                chosen_delta_loss < 0,
+                combo_index,
                 choices[:, group],
             )
             changed = chosen != choices[:, group]
@@ -754,158 +595,318 @@ def _sweep_hessian_local_scales(
                 chosen[:, None, None].expand(-1, 1, 8),
             ).squeeze(1)
             if bool(changed.any()):
-                reconstructed[changed, start:start + 8] = caches[group][
+                reconstructed[changed, start:start + 8] = combo_values[
                     changed,
                     chosen[changed],
                 ]
                 error[changed, start:start + 8] = (
-                    old_error[changed] - chosen_delta[changed]
+                    group_error[changed] - chosen_delta[changed]
                 )
                 hessian_error -= torch.bmm(
-                    hessian[:, :, start:start + 8],
+                    hessian_columns[group],
                     chosen_delta[:, :, None],
                 ).squeeze(-1)
                 loss = loss + torch.where(
                     changed,
-                    best_delta_loss,
-                    torch.zeros((), device=values.device),
+                    chosen_delta_loss,
+                    torch.zeros((), dtype=torch.float32, device=values.device),
                 )
             choices[:, group] = chosen
 
-    reconstructed, params = _materialize_block_choice(values, global_scale, choices)
-    loss, _ = _hessian_loss(values - reconstructed, hessian)
+    # Re-materialize from the final choices so the returned loss and the
+    # returned parameters provably describe the same values.
+    reconstructed, mantissa, sign, _ = _materialize_hif4_values(
+        values,
+        abs_values,
+        sign_values,
+        global_scale,
+        choices,
+    )
+    loss, _ = _block_hessian_loss(values - reconstructed, hessian)
+    lv2_options, lv3_options, _ = _local_scale_options(values.device)
+    params = {
+        "scale_factor": global_scale[:, None, None, None],
+        "scale_lv2": lv2_options[choices][:, :, None, None],
+        "scale_lv3": lv3_options[choices][:, :, :, None],
+        "sign": sign,
+        "mant": mantissa,
+    }
     return loss, changes, params
 
 
-def _select_hessian_winner(
-    current: tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]] | None,
-    loss: torch.Tensor,
-    changes: torch.Tensor,
-    scale: torch.Tensor,
-    params: dict[str, torch.Tensor],
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
-    """Select deterministically by loss, edit count, then smaller global scale."""
-    if current is None:
-        return loss, changes, scale, params
-    old_loss, old_changes, old_scale, old_params = current
+def _pick_hessian_candidate(
+    best: tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict] | None,
+    candidate_loss: torch.Tensor,
+    candidate_changes: torch.Tensor,
+    candidate_scale: torch.Tensor,
+    candidate_params: dict,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+    """Select by (loss, fewer local changes, smaller E6M2 scale, earlier)."""
+
+    if best is None:
+        return candidate_loss, candidate_changes, candidate_scale, candidate_params
+    best_loss, best_changes, best_scale, best_params = best
     better = (
-        (loss < old_loss)
-        | ((loss == old_loss) & (changes < old_changes))
-        | ((loss == old_loss) & (changes == old_changes) & (scale < old_scale))
+        (candidate_loss < best_loss)
+        | ((candidate_loss == best_loss) & (candidate_changes < best_changes))
+        | (
+            (candidate_loss == best_loss)
+            & (candidate_changes == best_changes)
+            & (candidate_scale < best_scale)
+        )
     )
-    condition = better[:, None, None, None]
-    selected_params = {
-        key: torch.where(condition, params[key], old_params[key])
-        for key in old_params
+    cond = better.view(int(candidate_loss.shape[0]), 1, 1, 1)
+    params = {
+        key: torch.where(cond, candidate_params[key], best_params[key])
+        for key in best_params
     }
     return (
-        torch.where(better, loss, old_loss),
-        torch.where(better, changes, old_changes),
-        torch.where(better, scale, old_scale),
-        selected_params,
+        torch.where(better, candidate_loss, best_loss),
+        torch.where(better, candidate_changes, best_changes),
+        torch.where(better, candidate_scale, best_scale),
+        params,
     )
 
 
-def _quantize_weight_with_block_hessian(
-    weight: torch.Tensor,
-    activation_second: torch.Tensor,
-    hessian_by_input_block: torch.Tensor,
-    baseline: dict[str, torch.Tensor],
+def _quantize_hif4_block_hessian_weight(
+    values: torch.Tensor,
+    error_weights: torch.Tensor,
+    hessian_reg: torch.Tensor,
+    v4_params: dict,
 ) -> dict[str, torch.Tensor]:
-    """Improve Linear weight blocks under their calibration-output Hessian."""
-    rows, channels = weight.shape
-    block_count = channels // 64
-    values = weight.reshape(rows, block_count, 64).reshape(-1, 64)
-    block_index = torch.arange(int(values.shape[0]), device=weight.device) % block_count
-    importance = activation_second.reshape(block_count, 64)
-    flat_baseline = {
-        key: tensor.reshape(rows * block_count, *tensor.shape[2:])
-        for key, tensor in baseline.items()
-    }
-    baseline_values = (
-        flat_baseline["sign"]
-        * flat_baseline["mant"]
-        * flat_baseline["scale_lv2"]
-        * flat_baseline["scale_lv3"]
-        * flat_baseline["scale_factor"]
-    ).reshape(-1, 64)
-    output = {key: torch.empty_like(value) for key, value in flat_baseline.items()}
-    coarse = torch.tensor(_GLOBAL_SCALE_MULTIPLIERS, device=weight.device)
-    refine = torch.tensor(_REFINEMENT_SCALE_MULTIPLIERS, device=weight.device)
+    """Quantize transformed Weight rows with guarded block-Hessian search."""
 
-    for start in range(0, int(values.shape[0]), _HESSIAN_CHUNK_BLOCKS):
-        end = min(start + _HESSIAN_CHUNK_BLOCKS, int(values.shape[0]))
-        batch = values[start:end]
-        batch_hessian = hessian_by_input_block[block_index[start:end]]
-        baseline_loss, _ = _hessian_loss(
-            batch - baseline_values[start:end],
+    rows, channels = values.shape
+    block_count = channels // _HIF4_BLOCK_SIZE
+    block_values = values.reshape(rows, block_count, 64).reshape(-1, 64)
+    abs_blocks = block_values.abs()
+    sign_blocks = torch.sign(block_values)
+    block_index = torch.arange(rows * block_count) % block_count
+    weight_blocks = error_weights.reshape(block_count, 64)
+    v4_flat = {
+        key: tensor.reshape(rows * block_count, *tensor.shape[2:])
+        for key, tensor in v4_params.items()
+    }
+    v4_reconstructed = (
+        v4_flat["sign"]
+        * v4_flat["mant"]
+        * v4_flat["scale_lv2"]
+        * v4_flat["scale_lv3"]
+        * v4_flat["scale_factor"]
+    ).reshape(rows * block_count, 64)
+
+    out = {key: torch.empty_like(v4_flat[key]) for key in v4_flat}
+    total_blocks = rows * block_count
+
+    multipliers = torch.tensor(
+        _GLOBAL_SCALE_MULTIPLIERS,
+        dtype=torch.float32,
+        device=values.device,
+    )
+    refinement_multipliers = torch.tensor(
+        _REFINEMENT_SCALE_MULTIPLIERS,
+        dtype=torch.float32,
+        device=values.device,
+    )
+    _, _, local_scale_options = _local_scale_options(values.device)
+
+    for start in range(0, total_blocks, _HESSIAN_CHUNK_BLOCKS):
+        end = min(start + _HESSIAN_CHUNK_BLOCKS, total_blocks)
+        batch_values = block_values[start:end]
+        batch_abs = abs_blocks[start:end]
+        batch_sign = sign_blocks[start:end]
+        batch_hessian = hessian_reg[block_index[start:end]]
+        batch_weights = weight_blocks[block_index[start:end]].reshape(-1, 8, 2, 4)
+        batch_size = int(batch_values.shape[0])
+
+        group_hessians = [
+            batch_hessian[:, g * 8:(g + 1) * 8, g * 8:(g + 1) * 8].contiguous()
+            for g in range(8)
+        ]
+        hessian_columns = [
+            batch_hessian[:, :, g * 8:(g + 1) * 8].contiguous()
+            for g in range(8)
+        ]
+
+        # Guard reference: the exact v4 parameters and their Hessian loss.
+        v4_loss, _ = _block_hessian_loss(
+            batch_values - v4_reconstructed[start:end],
             batch_hessian,
         )
-        batch_importance = importance[block_index[start:end]].reshape(-1, 8, 2, 4)
-        peak_scale = batch.abs().amax(dim=-1) / 7.0
-        candidate_scales = _snap_to_e6m2(peak_scale[:, None] * coarse[None])
-        _, initial_choices = _evaluate_scale_candidates(
-            batch.abs().reshape(-1, 8, 2, 4),
+
+        # Stage 1: the frozen v4 universe of 12 global scale candidates.
+        base_scale = batch_abs.amax(-1) / 7.0
+        candidate_scales = _snap_to_e6m2(
+            base_scale.unsqueeze(-1) * multipliers.unsqueeze(0)
+        )
+        _, local_choices = _evaluate_hif4_scale_candidates(
+            batch_abs.view(batch_size, 8, 2, 4),
             candidate_scales,
-            batch_importance,
+            local_scale_options,
+            batch_weights,
         )
-        winner = None
-        for candidate in range(len(_GLOBAL_SCALE_MULTIPLIERS)):
+
+        best: tuple | None = None
+        for candidate in range(12):
             scale = candidate_scales[:, candidate]
-            result_loss, changes, params = _sweep_hessian_local_scales(
-                batch,
+            loss, changes, params = _sweep_local_scales(
+                batch_values,
+                batch_abs,
+                batch_sign,
                 scale,
-                initial_choices[:, candidate],
+                local_choices[:, candidate],
                 batch_hessian,
+                group_hessians,
+                hessian_columns,
             )
-            winner = _select_hessian_winner(
-                winner,
-                result_loss,
-                changes,
-                scale,
-                params,
-            )
+            best = _pick_hessian_candidate(best, loss, changes, scale, params)
 
-        assert winner is not None
-        winner_scale = winner[2]
-        refined_scales = _snap_to_e6m2(winner_scale[:, None] * refine[None])
-        _, refined_choices = _evaluate_scale_candidates(
-            batch.abs().reshape(-1, 8, 2, 4),
-            refined_scales,
-            batch_importance,
+        _, _, winner_scale, _ = best
+
+        # Stage 2: the frozen v4 refinement candidates around the winner.
+        refinement_scales = _snap_to_e6m2(
+            winner_scale.unsqueeze(-1) * refinement_multipliers.unsqueeze(0)
         )
-        refined_winner = None
-        for candidate in range(len(_REFINEMENT_SCALE_MULTIPLIERS)):
-            scale = refined_scales[:, candidate]
-            result_loss, changes, params = _sweep_hessian_local_scales(
-                batch,
+        _, refinement_choices = _evaluate_hif4_scale_candidates(
+            batch_abs.view(batch_size, 8, 2, 4),
+            refinement_scales,
+            local_scale_options,
+            batch_weights,
+        )
+
+        refined_best: tuple | None = None
+        for candidate in range(5):
+            scale = refinement_scales[:, candidate]
+            loss, changes, params = _sweep_local_scales(
+                batch_values,
+                batch_abs,
+                batch_sign,
                 scale,
-                refined_choices[:, candidate],
+                refinement_choices[:, candidate],
                 batch_hessian,
+                group_hessians,
+                hessian_columns,
             )
-            refined_winner = _select_hessian_winner(
-                refined_winner,
-                result_loss,
+            refined_best = _pick_hessian_candidate(
+                refined_best,
+                loss,
                 changes,
                 scale,
                 params,
             )
 
-        assert refined_winner is not None
-        improved_loss, _, _, improved_params = refined_winner
-        use_improved = improved_loss < baseline_loss * (1.0 - _HESSIAN_MIN_IMPROVEMENT)
-        condition = use_improved[:, None, None, None]
-        for key in output:
-            output[key][start:end] = torch.where(
-                condition,
-                improved_params[key],
-                flat_baseline[key][start:end],
+        v5_loss, _, _, v5_params = refined_best
+
+        # A block is replaced only when the v5 candidate is strictly better
+        # than the exact v4 parameters by the frozen 1 percent gate.
+        use_v5 = v5_loss < v4_loss * (1.0 - _HESSIAN_MIN_REPLACE_IMPROVEMENT)
+        cond = use_v5.view(batch_size, 1, 1, 1)
+        for key in v4_flat:
+            out[key][start:end] = torch.where(
+                cond,
+                v5_params[key],
+                v4_flat[key][start:end],
             )
 
     return {
-        key: value.reshape(rows, block_count, *value.shape[1:]).contiguous()
-        for key, value in output.items()
+        key: tensor.reshape(rows, block_count, *tensor.shape[1:]).contiguous()
+        for key, tensor in out.items()
     }
+
+
+def _block_signs64(block_count: int, device: torch.device) -> torch.Tensor:
+    """Return deterministic Rademacher signs, one vector per 64D block."""
+
+    block = torch.arange(block_count, dtype=torch.int64, device=device)[:, None]
+    lane = torch.arange(64, dtype=torch.int64, device=device)[None, :]
+    hashed = (lane * 1103515245 + block * 12345 + 0x9E3779B9) & 0x7FFFFFFF
+    return torch.where(((hashed >> 16) & 1) == 0, 1.0, -1.0)
+
+
+def _apply_block_hadamard(x: torch.Tensor) -> torch.Tensor:
+    """Apply a fixed signed orthonormal Hadamard transform per HiF4 block."""
+
+    if int(x.shape[-1]) % _HIF4_BLOCK_SIZE != 0:
+        raise ValueError("Hadamard input channels must be divisible by 64")
+    original_shape = tuple(x.shape)
+    y = x.to(dtype=torch.float32).reshape(-1, x.shape[-1] // 64, 64)
+    y = y * _block_signs64(int(y.shape[1]), y.device).unsqueeze(0)
+    for width in (1, 2, 4, 8, 16, 32):
+        groups = y.reshape(*y.shape[:-1], -1, 2 * width)
+        left = groups[..., :width]
+        right = groups[..., width:]
+        y = torch.cat((left + right, left - right), dim=-1).reshape(*y.shape)
+    return (y * 0.125).reshape(original_shape)
+
+
+def _apply_attention_hadamard(
+    x: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+) -> torch.Tensor:
+    """Apply identical block transforms inside every attention head."""
+
+    original_shape = tuple(x.shape)
+    per_head = x.reshape(-1, num_heads, head_dim).reshape(-1, head_dim)
+    return _apply_block_hadamard(per_head).reshape(original_shape)
+
+
+def _smooth_scale(
+    left_abs_max: torch.Tensor,
+    right_abs_max: torch.Tensor,
+    alpha: float,
+) -> torch.Tensor:
+    """Construct a bounded reciprocal equivalent-transformation scale."""
+
+    left = left_abs_max.float().clamp_min(1.0e-6)
+    right = right_abs_max.float().clamp_min(1.0e-6)
+    scale = left.pow(alpha) / right.pow(1.0 - alpha)
+    return torch.nan_to_num(scale, nan=1.0, posinf=1.0, neginf=1.0).clamp(
+        min=_SMOOTH_SCALE_MIN,
+        max=_SMOOTH_SCALE_MAX,
+    )
+
+
+def _state_tensor(state: Any, key: str, expected_shape: tuple[int, ...]) -> torch.Tensor:
+    if type(state) is not dict or type(state.get(key)) is not torch.Tensor:
+        raise ValueError(f"state must contain CPU tensor {key!r}")
+    value = state[key]
+    if tuple(value.shape) != expected_shape:
+        raise ValueError(
+            f"state[{key!r}] shape {tuple(value.shape)} != {expected_shape}"
+        )
+    return value.detach().to(dtype=torch.float32)
+
+
+def _make_state(role: str) -> dict[str, Any]:
+    """Create a small self_check-compatible immutable-by-convention state."""
+
+    return {
+        "schema_version": 5,
+        "algorithm": "hif4-v4-guarded-e6m2-refinement",
+        "role": role,
+        "calibration_used": True,
+    }
+
+
+def _validate_attention_shape(
+    quant_float: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    role: str,
+) -> None:
+    if type(num_heads) is not int or num_heads <= 0:
+        raise ValueError(f"{role}: num_heads must be a positive int")
+    if type(head_dim) is not int or head_dim <= 0:
+        raise ValueError(f"{role}: head_dim must be a positive int")
+    if quant_float.ndim != 2:
+        raise ValueError(f"{role}: quant tensor must be 2D [seq_len, hidden]")
+    expected_hidden = num_heads * head_dim
+    if int(quant_float.shape[-1]) != expected_hidden:
+        raise ValueError(
+            f"{role}: hidden size {quant_float.shape[-1]} does not match "
+            f"num_heads * head_dim ({expected_hidden})"
+        )
 
 
 # =============================================================================
@@ -1029,22 +1030,24 @@ def hif4_calibration_and_quantize_weight(
         本模板不提供 HiF4 参考实现。
     """
     weight = _dequantize_nvfp4_fp32(weight_quant, weight_scale)
-    channels = int(weight.shape[-1])
-    if not calib_activation_list:
-        raise ValueError("calib_activation_list must not be empty")
+    if weight.ndim != 2:
+        raise ValueError("weight must be a 2D tensor")
+    if not isinstance(calib_activation_list, list) or not calib_activation_list:
+        raise ValueError("calib_activation_list must be a non-empty list")
 
+    channels = int(weight.shape[-1])
     activation_abs_max = torch.zeros(
         channels,
         dtype=torch.float32,
         device=weight.device,
     )
-    decoded_activations: list[torch.Tensor] = []
     for quant, scale in calib_activation_list:
         activation = _dequantize_nvfp4_fp32(quant, scale)
-        decoded_activations.append(activation)
+        if int(activation.shape[-1]) != channels:
+            raise ValueError("calibration activation channels do not match weight")
         activation_abs_max = torch.maximum(
             activation_abs_max,
-            activation.abs().reshape(-1, channels).amax(dim=0),
+            activation.abs().amax(dim=tuple(range(activation.ndim - 1))),
         )
 
     smooth = _smooth_scale(
@@ -1052,51 +1055,46 @@ def hif4_calibration_and_quantize_weight(
         weight.abs().amax(dim=0),
         _LINEAR_SMOOTH_ALPHA,
     )
-    rotation_signs = _block_signs64(channels)
-    transformed_weight = _apply_hadamard_rotation(
-        weight * smooth,
-        rotation_signs,
-        block_size=64,
-    )
+    transformed_weight = _apply_block_hadamard(weight * smooth)
 
-    activation_second = torch.zeros(
-        channels,
-        dtype=torch.float32,
-        device=weight.device,
-    )
+    activation_second = torch.zeros_like(smooth)
     activation_count = 0
     transformed_activations: list[torch.Tensor] = []
-    for activation in decoded_activations:
-        transformed = _apply_hadamard_rotation(
-            activation / smooth,
-            rotation_signs,
-            block_size=64,
-        )
+    for quant, scale in calib_activation_list:
+        activation = _dequantize_nvfp4_fp32(quant, scale)
+        transformed = _apply_block_hadamard(activation / smooth)
         transformed_activations.append(transformed)
-        activation_second += transformed.reshape(-1, channels).square().sum(dim=0)
+        activation_second += transformed.square().sum(
+            dim=tuple(range(transformed.ndim - 1))
+        )
         activation_count += transformed.numel() // channels
-    activation_second = (activation_second / max(activation_count, 1)).clamp_min(
-        1.0e-8
-    )
-    activation_importance = transformed_weight.square().sum(dim=0).clamp_min(1.0e-8)
-    baseline_weight_params = _quantize_hif4_search(
-        transformed_weight,
-        importance=activation_second,
-    )
-    weight_params = _quantize_weight_with_block_hessian(
+    activation_second = activation_second / max(activation_count, 1)
+    activation_second = activation_second.clamp_min(1.0e-8)
+
+    # v5: replace the diagonal objective with the damped per-block Hessian.
+    # The exact v4 parameters remain the guard candidate for every block.
+    hessian_reg = _build_block_hessian_reg(transformed_activations, channels)
+    v4_weight_params = _quantize_hif4(transformed_weight, activation_second)
+    weight_params = _quantize_hif4_block_hessian_weight(
         transformed_weight,
         activation_second,
-        _build_block_hessian(transformed_activations, channels),
-        baseline_weight_params,
+        hessian_reg,
+        v4_weight_params,
     )
+
+    activation_importance = transformed_weight.square().sum(dim=0).clamp_min(1.0e-8)
+    state = _make_state("activation")
+    state.update({
+        "schema_version": 6,
+        "algorithm": "hif4-v5-block-hessian-weight",
+        "smooth_scale": smooth.detach().cpu().contiguous(),
+        "error_weights": activation_importance.detach().cpu().contiguous(),
+        "smooth_alpha": _LINEAR_SMOOTH_ALPHA,
+        "rotation": "signed-hadamard-64",
+    })
     return {
         "weight_params": weight_params,
-        "activation_state": {
-            "rotation_block": 64,
-            "rotation_signs": rotation_signs,
-            "smooth_scale": smooth.detach().cpu().contiguous(),
-            "importance": activation_importance.detach().cpu().contiguous(),
-        },
+        "activation_state": state,
     }
 
 
@@ -1131,29 +1129,16 @@ def hif4_dynamic_quantize_activation(
         当前 Activation 对应的 HiF4Params。
         输出参数的逻辑 Tensor shape 必须与当前 Activation 一致。
     """
-    activation = _dequantize_nvfp4_fp32(
-        activation_quant,
-        activation_scale,
+    channels = int(activation_quant.shape[-1])
+    smooth = _state_tensor(activation_state, "smooth_scale", (channels,))
+    error_weights = _state_tensor(
+        activation_state,
+        "error_weights",
+        (channels,),
     )
-    if isinstance(activation_state, dict) and "smooth_scale" in activation_state:
-        smooth = activation_state["smooth_scale"].to(
-            device=activation.device,
-            dtype=torch.float32,
-        )
-        activation = activation / smooth
-    if isinstance(activation_state, dict) and "rotation_signs" in activation_state:
-        activation = _apply_hadamard_rotation(
-            activation,
-            activation_state["rotation_signs"],
-            int(activation_state.get("rotation_block", 4)),
-        )
-    importance = None
-    if isinstance(activation_state, dict) and "importance" in activation_state:
-        importance = activation_state["importance"]
-    return _quantize_hif4_search(
-        activation,
-        importance=importance,
-    )
+    activation = _dequantize_nvfp4_fp32(activation_quant, activation_scale)
+    transformed = _apply_block_hadamard(activation / smooth)
+    return _quantize_hif4(transformed, error_weights)
 
 
 # =============================================================================
@@ -1222,19 +1207,28 @@ def hif4_calibration_attention(
             - importance
             - 其他动态量化需要使用的 calibration 结果
     """
-    if kv_num_heads <= 0 or q_num_heads <= 0 or q_num_heads % kv_num_heads != 0:
-        raise ValueError(
-            f"q_num_heads {q_num_heads} is not divisible by kv_num_heads {kv_num_heads}"
-        )
-    q_per_kv = q_num_heads // kv_num_heads
+    if not isinstance(calib_qkv_list, list) or not calib_qkv_list:
+        raise ValueError("calib_qkv_list must be a non-empty list")
+    if type(q_num_heads) is not int or q_num_heads <= 0:
+        raise ValueError("q_num_heads must be a positive int")
+    if type(kv_num_heads) is not int or kv_num_heads <= 0:
+        raise ValueError("kv_num_heads must be a positive int")
+    if type(head_dim) is not int or head_dim <= 0:
+        raise ValueError("head_dim must be a positive int")
+    if q_num_heads % kv_num_heads != 0:
+        raise ValueError("q_num_heads must be divisible by kv_num_heads")
+
     q_abs_max = torch.zeros((q_num_heads, head_dim), dtype=torch.float32)
     k_abs_max = torch.zeros((kv_num_heads, head_dim), dtype=torch.float32)
-    v_weighted_energy = torch.zeros((kv_num_heads, head_dim), dtype=torch.float32)
-    v_usage_total = torch.zeros((kv_num_heads, 1), dtype=torch.float32)
     for sample in calib_qkv_list:
-        q = _dequantize_nvfp4_fp32(*sample["q"])
-        k = _dequantize_nvfp4_fp32(*sample["k"])
-        v = _dequantize_nvfp4_fp32(*sample["v"])
+        if type(sample) is not dict:
+            raise ValueError("each attention calibration sample must be a dict")
+        q_quant, q_scale = sample["q"]
+        k_quant, k_scale = sample["k"]
+        q = _dequantize_nvfp4_fp32(q_quant, q_scale)
+        k = _dequantize_nvfp4_fp32(k_quant, k_scale)
+        _validate_attention_shape(q_quant, q_num_heads, head_dim, "q calibration")
+        _validate_attention_shape(k_quant, kv_num_heads, head_dim, "k calibration")
         q_abs_max = torch.maximum(
             q_abs_max,
             q.reshape(-1, q_num_heads, head_dim).abs().amax(dim=0).cpu(),
@@ -1243,57 +1237,39 @@ def hif4_calibration_attention(
             k_abs_max,
             k.reshape(-1, kv_num_heads, head_dim).abs().amax(dim=0).cpu(),
         )
-        sample_energy, sample_usage = _attention_weighted_v_energy(
-            q,
-            k,
-            v,
-            q_num_heads,
-            kv_num_heads,
-            head_dim,
-        )
-        v_weighted_energy += sample_energy.cpu()
-        v_usage_total += sample_usage.cpu()
 
-    q_group_max = q_abs_max.reshape(
+    q_per_kv = q_abs_max.reshape(
         kv_num_heads,
-        q_per_kv,
+        q_num_heads // kv_num_heads,
         head_dim,
     ).amax(dim=1)
     kv_smooth = _smooth_scale(
-        q_group_max,
+        q_per_kv,
         k_abs_max,
         _ATTENTION_SMOOTH_ALPHA,
     ).cpu()
     q_smooth = kv_smooth[:, None, :].expand(
         kv_num_heads,
-        q_per_kv,
+        q_num_heads // kv_num_heads,
         head_dim,
     ).reshape(q_num_heads, head_dim).contiguous()
 
-    # Reset the signed H64 pattern in every head and share it across mapped
-    # Q/K heads.  Q/s and K*s followed by the same orthogonal transform leave
-    # the full-precision attention logits unchanged before quantization.
-    head_signs = _block_signs64(head_dim).reshape(1, head_dim)
-    q_signs = head_signs.expand(q_num_heads, head_dim).reshape(-1).contiguous()
-    k_signs = head_signs.expand(kv_num_heads, head_dim).reshape(-1).contiguous()
-    return {
-        "q_state": {
-            "rotation_block": 64,
-            "rotation_signs": q_signs,
-            "smooth_scale": q_smooth,
-        },
-        "k_state": {
-            "rotation_block": 64,
-            "rotation_signs": k_signs,
-            "smooth_scale": kv_smooth.contiguous(),
-        },
-        "v_state": {
-            "importance": _finalize_v_importance(
-                v_weighted_energy,
-                v_usage_total,
-            ),
-        },
-    }
+    q_state = _make_state("q")
+    q_state.update({
+        "smooth_scale": q_smooth,
+        "smooth_alpha": _ATTENTION_SMOOTH_ALPHA,
+        "rotation": "per-head-signed-hadamard-64",
+    })
+    k_state = _make_state("k")
+    k_state.update({
+        "smooth_scale": kv_smooth.contiguous(),
+        "smooth_alpha": _ATTENTION_SMOOTH_ALPHA,
+        "rotation": "per-head-signed-hadamard-64",
+    })
+    v_state = _make_state("v")
+    v_state["calibration_used"] = False
+    v_state["rotation"] = "none"
+    return {"q_state": q_state, "k_state": k_state, "v_state": v_state}
 
 
 # =============================================================================
@@ -1330,20 +1306,20 @@ def hif4_dynamic_quantize_q(
     Returns:
         当前 Q 对应的 HiF4Params。
     """
+    _validate_attention_shape(q_quant, q_num_heads, head_dim, "q")
+    smooth = _state_tensor(
+        q_state,
+        "smooth_scale",
+        (q_num_heads, head_dim),
+    )
     q = _dequantize_nvfp4_fp32(q_quant, q_scale)
-    if isinstance(q_state, dict) and "smooth_scale" in q_state:
-        smooth = q_state["smooth_scale"].to(
-            device=q.device,
-            dtype=torch.float32,
-        )
-        q = (q.reshape(-1, q_num_heads, head_dim) / smooth).reshape(q.shape)
-    if isinstance(q_state, dict) and "rotation_signs" in q_state:
-        q = _apply_hadamard_rotation(
-            q,
-            q_state["rotation_signs"],
-            int(q_state.get("rotation_block", 8)),
-        )
-    return _quantize_hif4_search(q)
+    transformed = (q.reshape(-1, q_num_heads, head_dim) / smooth).reshape_as(q)
+    transformed = _apply_attention_hadamard(
+        transformed,
+        q_num_heads,
+        head_dim,
+    )
+    return _quantize_hif4(transformed)
 
 
 # =============================================================================
@@ -1380,20 +1356,20 @@ def hif4_dynamic_quantize_k(
     Returns:
         当前 K 对应的 HiF4Params。
     """
+    _validate_attention_shape(k_quant, kv_num_heads, head_dim, "k")
+    smooth = _state_tensor(
+        k_state,
+        "smooth_scale",
+        (kv_num_heads, head_dim),
+    )
     k = _dequantize_nvfp4_fp32(k_quant, k_scale)
-    if isinstance(k_state, dict) and "smooth_scale" in k_state:
-        smooth = k_state["smooth_scale"].to(
-            device=k.device,
-            dtype=torch.float32,
-        )
-        k = (k.reshape(-1, kv_num_heads, head_dim) * smooth).reshape(k.shape)
-    if isinstance(k_state, dict) and "rotation_signs" in k_state:
-        k = _apply_hadamard_rotation(
-            k,
-            k_state["rotation_signs"],
-            int(k_state.get("rotation_block", 8)),
-        )
-    return _quantize_hif4_search(k)
+    transformed = (k.reshape(-1, kv_num_heads, head_dim) * smooth).reshape_as(k)
+    transformed = _apply_attention_hadamard(
+        transformed,
+        kv_num_heads,
+        head_dim,
+    )
+    return _quantize_hif4(transformed)
 
 
 # =============================================================================
@@ -1430,44 +1406,6 @@ def hif4_dynamic_quantize_v(
     Returns:
         当前 V 对应的 HiF4Params。
     """
-    v = _dequantize_nvfp4_fp32(v_quant, v_scale)
-    if not isinstance(v_state, dict) or "importance" not in v_state:
-        return _quantize_hif4_search(v)
-
-    importance = v_state["importance"].to(
-        device=v.device,
-        dtype=torch.float32,
-    ).reshape(-1)
-    if importance.numel() != kv_num_heads * head_dim:
-        raise ValueError("V importance shape does not match attention dimensions")
-    baseline = _quantize_hif4_search(v)
-    candidate = _quantize_hif4_search(v, importance=importance)
-    baseline_error = (v - _reconstruct_hif4(baseline, v)).square().reshape(-1, 64)
-    candidate_error = (v - _reconstruct_hif4(candidate, v)).square().reshape(-1, 64)
-    weight_blocks = importance.reshape(-1, 64).unsqueeze(0).expand(
-        int(v.shape[0]),
-        -1,
-        -1,
-    ).reshape(-1, 64)
-    baseline_plain = baseline_error.sum(dim=-1)
-    candidate_plain = candidate_error.sum(dim=-1)
-    baseline_weighted = (baseline_error * weight_blocks).sum(dim=-1)
-    candidate_weighted = (candidate_error * weight_blocks).sum(dim=-1)
-    use_candidate = (
-        candidate_weighted
-        < baseline_weighted * (1.0 - _V_MIN_WEIGHTED_IMPROVEMENT)
-    ) & (
-        candidate_plain
-        <= baseline_plain * (1.0 + _V_MAX_PLAIN_REGRESSION)
-    )
-    mask = use_candidate.reshape(
-        int(v.shape[0]),
-        int(v.shape[-1]) // 64,
-        1,
-        1,
-        1,
-    )
-    return {
-        key: torch.where(mask, candidate[key], baseline[key]).contiguous()
-        for key in baseline
-    }
+    _ = v_state
+    _validate_attention_shape(v_quant, kv_num_heads, head_dim, "v")
+    return _quantize_nvfp4_pair(v_quant, v_scale)
