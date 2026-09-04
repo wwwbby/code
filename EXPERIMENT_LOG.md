@@ -114,6 +114,17 @@ hold:
   non-Hessian replacement. They failed on heavy-tail and sparse-outlier
   families because a few learned directions do not spread general outliers as
   reliably as H64. They were removed.
+- A second fixed signed-Hadamard stage for Q/K preserved the exact floating-
+  point attention logits but reduced the robust Attention mean from
+  `0.46303/0.32948` to `0.39043/0.26784`; the worst case became negative. It
+  was removed without server submission.
+- Replacing the 12+5 scale search with one 17-point grid slightly improved the
+  public Linear proxy (`0.75724 -> 0.75755`) but reduced robust full Attention
+  (`0.46303 -> 0.44879`) and was slower locally. A one-candidate closed-form
+  least-squares scale update was faster on public Linear (`23.58 -> 22.73 s`)
+  but regressed both public Linear (`0.75724 -> 0.75677`) and robust Attention
+  (`0.46303/0.32948 -> 0.45821/0.32812`). Both scale-search replacements were
+  removed.
 
 ## Distribution-level Linear ablation
 
@@ -175,3 +186,12 @@ paths. Prefer fixed transforms, codebook/scale phase choices, and mechanisms
 whose dynamic overhead is negligible. Treat all local Qwen, public, and
 synthetic scores as rejection tests only until a proxy is shown to preserve
 the ordering of multiple online submissions.
+
+## Numerically identical runtime tuning
+
+The generic scale-search chunk was swept on the public Linear case without
+changing any candidate, tie break, or output tensor. Local times were about
+`22.54 s` at 1024 blocks, `22.33 s` at 2048, `23.5 s` at the old 4096,
+`21.69--21.80 s` at 8192, and `23.52 s` at 16384. The search chunk is therefore
+8192; the Hessian chunk remains 8192. This is a performance-only change, so its
+expected score is exactly the `def4524` baseline while freeing server headroom.

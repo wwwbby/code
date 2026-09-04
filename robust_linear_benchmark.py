@@ -426,6 +426,8 @@ def main() -> None:
     parser.add_argument("--real-dataset")
     parser.add_argument("--public-linear")
     parser.add_argument("--show-statistics", action="store_true")
+    parser.add_argument("--search-chunk", type=int)
+    parser.add_argument("--hessian-chunk", type=int)
     parser.add_argument(
         "--modes",
         nargs="+",
@@ -482,6 +484,10 @@ def main() -> None:
 
     for revision, mode in configurations:
         solution = load_solution(repo, revision)
+        if args.search_chunk is not None:
+            solution._SEARCH_CHUNK_BLOCKS = args.search_chunk
+        if args.hessian_chunk is not None:
+            solution._HESSIAN_CHUNK_BLOCKS = args.hessian_chunk
         if mode == "current-no-H":
             disable_linear_hessian(solution)
         else:
