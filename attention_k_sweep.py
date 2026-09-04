@@ -19,6 +19,8 @@ def main() -> None:
     )
     parser.add_argument("--thresholds", nargs="+", type=float, default=[0.10])
     parser.add_argument("--token-caps", nargs="+", type=int, default=[64])
+    parser.add_argument("--output-blends", nargs="+", type=float, default=[0.25])
+    parser.add_argument("--position-buckets", nargs="+", type=int, default=[2])
     args = parser.parse_args()
     repo = Path(__file__).resolve().parent
     if args.public_datasets_dir:
@@ -38,26 +40,31 @@ def main() -> None:
     for config in args.configs:
         for threshold in args.thresholds:
             for token_cap in args.token_caps:
-                rank_text, sweeps_text = config.split("x", 1)
-                solution = load_solution(repo, "worktree")
-                solution._ATTENTION_K_HESSIAN_RANK = int(rank_text)
-                solution._ATTENTION_K_HESSIAN_SWEEPS = int(sweeps_text)
-                solution._ATTENTION_K_HESSIAN_MIN_REPLACE_IMPROVEMENT = threshold
-                solution._ATTENTION_K_HESSIAN_MAX_TOKENS = token_cap
-                started = time.perf_counter()
-                results = []
-                for original in cases:
-                    case = copy.copy(original)
-                    case["linear"] = dummy_linear()
-                    result = evaluate_case(solution, case)
-                    results.append(result)
-                full = sum(item["attention_full"] for item in results) / len(results)
-                causal = sum(item["attention_causal"] for item in results) / len(results)
-                print(
-                    f"{config:5s} threshold={threshold:.3f} tokens={token_cap:3d} "
-                    f"full={full:+.5f} causal={causal:+.5f} "
-                    f"elapsed={time.perf_counter() - started:.2f}s"
-                )
+                for output_blend in args.output_blends:
+                    for position_buckets in args.position_buckets:
+                        rank_text, sweeps_text = config.split("x", 1)
+                        solution = load_solution(repo, "worktree")
+                        solution._ATTENTION_K_HESSIAN_RANK = int(rank_text)
+                        solution._ATTENTION_K_HESSIAN_SWEEPS = int(sweeps_text)
+                        solution._ATTENTION_K_HESSIAN_MIN_REPLACE_IMPROVEMENT = threshold
+                        solution._ATTENTION_K_HESSIAN_MAX_TOKENS = token_cap
+                        solution._ATTENTION_K_OUTPUT_HESSIAN_BLEND = output_blend
+                        solution._ATTENTION_K_POSITION_BUCKETS = position_buckets
+                        started = time.perf_counter()
+                        results = []
+                        for original in cases:
+                            case = copy.copy(original)
+                            case["linear"] = dummy_linear()
+                            result = evaluate_case(solution, case)
+                            results.append(result)
+                        full = sum(item["attention_full"] for item in results) / len(results)
+                        causal = sum(item["attention_causal"] for item in results) / len(results)
+                        print(
+                            f"{config:5s} threshold={threshold:.3f} tokens={token_cap:3d} "
+                            f"blend={output_blend:.2f} buckets={position_buckets:d} "
+                            f"full={full:+.5f} causal={causal:+.5f} "
+                            f"elapsed={time.perf_counter() - started:.2f}s"
+                        )
 
 
 if __name__ == "__main__":

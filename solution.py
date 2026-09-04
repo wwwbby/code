@@ -50,6 +50,8 @@ _ATTENTION_K_HESSIAN_MAX_TOKENS = 64
 _ATTENTION_K_HESSIAN_RANK = 8
 _ATTENTION_K_HESSIAN_SWEEPS = 2
 _ATTENTION_K_HESSIAN_MIN_REPLACE_IMPROVEMENT = 0.10
+_ATTENTION_K_POSITION_BUCKETS = 2
+_ATTENTION_K_OUTPUT_HESSIAN_BLEND = 0.25
 _SMOOTH_SCALE_MIN = 1.0 / 16.0
 _SMOOTH_SCALE_MAX = 16.0
 
@@ -82,8 +84,8 @@ _HESSIAN_DAMPING = 0.01
 _HESSIAN_SWEEP_ROUNDS = 2
 _HESSIAN_CHUNK_BLOCKS = 8192
 _HESSIAN_MIN_REPLACE_IMPROVEMENT = 0.01
-_HESSIAN_LOW_RANK = 32
-_HESSIAN_LOW_RANK_SWEEPS = 1
+_HESSIAN_LOW_RANK = 40
+_HESSIAN_LOW_RANK_SWEEPS = 2
 
 
 # =============================================================================
@@ -1119,6 +1121,7 @@ def _quantize_hif4_low_rank_hessian(
     precomputed_factors: tuple[torch.Tensor, torch.Tensor] | None = None,
     sweep_rounds: int | None = None,
     min_replace_improvement: float | None = None,
+    hessian_indices: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Refine local scales under an exact-diagonal plus rank-r Hessian."""
 
@@ -1126,7 +1129,14 @@ def _quantize_hif4_low_rank_hessian(
     block_count = channels // _HIF4_BLOCK_SIZE
     total_blocks = rows * block_count
     block_values = values.reshape(rows, block_count, 64).reshape(-1, 64)
-    block_index = torch.arange(total_blocks, device=values.device) % block_count
+    if hessian_indices is None:
+        block_index = torch.arange(total_blocks, device=values.device) % block_count
+    else:
+        if tuple(hessian_indices.shape) != (rows, block_count):
+            raise ValueError("hessian_indices must have shape [rows, block_count]")
+        block_index = hessian_indices.reshape(-1).to(
+            device=values.device, dtype=torch.int64
+        )
     if precomputed_factors is None:
         if hessian_reg is None:
             raise ValueError("hessian_reg is required without precomputed factors")
@@ -1358,6 +1368,93 @@ def _attention_v_statistics(
     return energy, usage_total
 
 
+def _attention_k_output_hessian(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_smooth: torch.Tensor,
+    q_num_heads: int,
+    kv_num_heads: int,
+    head_dim: int,
+) -> torch.Tensor:
+    """Approximate each K position bucket's Attention-output Hessian."""
+
+    length = int(q.shape[0])
+    head_blocks = head_dim // _HIF4_BLOCK_SIZE
+    bucket_count = _ATTENTION_K_POSITION_BUCKETS
+    if length > _V_IMPORTANCE_MAX_QUERY_POSITIONS:
+        positions = torch.linspace(
+            0,
+            length - 1,
+            steps=_V_IMPORTANCE_MAX_QUERY_POSITIONS,
+            dtype=torch.float32,
+        ).round().to(torch.int64)
+    else:
+        positions = torch.arange(length, dtype=torch.int64)
+    key_positions = torch.arange(length, dtype=torch.int64)
+    key_buckets = torch.div(
+        key_positions * bucket_count,
+        max(length, 1),
+        rounding_mode="floor",
+    ).clamp_max(bucket_count - 1)
+
+    q_heads = q.reshape(length, q_num_heads, head_dim).permute(1, 0, 2)
+    k_heads = k.reshape(length, kv_num_heads, head_dim).permute(1, 0, 2)
+    v_heads = v.reshape(length, kv_num_heads, head_dim).permute(1, 0, 2)
+    q_transformed = _apply_attention_hadamard(
+        (q.reshape(length, q_num_heads, head_dim) / q_smooth).reshape_as(q),
+        q_num_heads,
+        head_dim,
+    ).reshape(length, q_num_heads, head_dim).permute(1, 0, 2)
+    q_per_kv = q_num_heads // kv_num_heads
+    hessian = torch.zeros(
+        (
+            bucket_count,
+            kv_num_heads,
+            head_blocks,
+            _HIF4_BLOCK_SIZE,
+            _HIF4_BLOCK_SIZE,
+        ),
+        dtype=torch.float32,
+    )
+    inverse_dim = 1.0 / float(head_dim)
+    for head in range(kv_num_heads):
+        head_slice = slice(head * q_per_kv, (head + 1) * q_per_kv)
+        queries = q_heads[head_slice, positions].to(torch.float32)
+        transformed_queries = q_transformed[head_slice, positions].reshape(
+            q_per_kv,
+            -1,
+            head_blocks,
+            _HIF4_BLOCK_SIZE,
+        )
+        keys = k_heads[head].to(torch.float32)
+        values = v_heads[head].to(torch.float32)
+        logits = queries @ keys.T * (float(head_dim) ** -0.5)
+        full = torch.softmax(logits, dim=-1)
+        causal_mask = key_positions[None, :] <= positions[:, None]
+        causal = torch.softmax(
+            logits.masked_fill(~causal_mask[None], float("-inf")), dim=-1
+        )
+        value_norm = values.square().sum(dim=-1)
+        for probability in (full, causal):
+            output = probability @ values
+            distance = (
+                output.square().sum(dim=-1, keepdim=True)
+                + value_norm[None, None, :]
+                - 2.0 * (output @ values.T)
+            ).clamp_min(0.0)
+            sensitivity = probability.square() * distance * inverse_dim
+            for bucket in range(bucket_count):
+                coefficient = sensitivity[..., key_buckets == bucket].sum(dim=-1)
+                hessian[bucket, head] += 0.5 * torch.einsum(
+                    "gp,gpbi,gpbj->bij",
+                    coefficient,
+                    transformed_queries,
+                    transformed_queries,
+                ).cpu()
+    return hessian
+
+
 def _finalize_v_importance(
     weighted_energy: torch.Tensor,
     usage_total: torch.Tensor,
@@ -1450,6 +1547,8 @@ def _calibrate_attention_smooth_v(
     v_weighted_energy = torch.zeros((kv_num_heads, head_dim), dtype=torch.float32)
     v_usage_total = torch.zeros((kv_num_heads, 1), dtype=torch.float32)
     calibration_q: list[torch.Tensor] = []
+    calibration_k: list[torch.Tensor] = []
+    calibration_v: list[torch.Tensor] = []
     for sample in calib_qkv_list:
         if type(sample) is not dict:
             raise ValueError("each attention calibration sample must be a dict")
@@ -1460,6 +1559,8 @@ def _calibrate_attention_smooth_v(
         k = _dequantize_nvfp4_fp32(k_quant, k_scale)
         v = _dequantize_nvfp4_fp32(v_quant, v_scale)
         calibration_q.append(q)
+        calibration_k.append(k)
+        calibration_v.append(v)
         _validate_attention_shape(q_quant, q_num_heads, head_dim, "q calibration")
         _validate_attention_shape(k_quant, kv_num_heads, head_dim, "k calibration")
         _validate_attention_shape(v_quant, kv_num_heads, head_dim, "v calibration")
@@ -1542,6 +1643,38 @@ def _calibrate_attention_smooth_v(
     k_hessian = (
         k_hessian / normalization[:, None, None] + _HESSIAN_DAMPING * eye
     )
+    output_hessian = torch.zeros(
+        (
+            _ATTENTION_K_POSITION_BUCKETS,
+            kv_num_heads,
+            head_blocks,
+            _HIF4_BLOCK_SIZE,
+            _HIF4_BLOCK_SIZE,
+        ),
+        dtype=torch.float32,
+    )
+    for q, k, v in zip(calibration_q, calibration_k, calibration_v):
+        output_hessian += _attention_k_output_hessian(
+            q, k, v, q_smooth, q_num_heads, kv_num_heads, head_dim
+        )
+    output_hessian = output_hessian.reshape(
+        _ATTENTION_K_POSITION_BUCKETS,
+        -1,
+        _HIF4_BLOCK_SIZE,
+        _HIF4_BLOCK_SIZE,
+    )
+    output_trace = torch.diagonal(
+        output_hessian, dim1=-2, dim2=-1
+    ).sum(dim=-1)
+    output_normalization = (
+        output_trace / float(_HIF4_BLOCK_SIZE)
+    ).clamp_min(1.0e-8)
+    output_hessian = output_hessian / output_normalization[:, :, None, None]
+    k_hessian = (
+        (1.0 - _ATTENTION_K_OUTPUT_HESSIAN_BLEND) * k_hessian[None]
+        + _ATTENTION_K_OUTPUT_HESSIAN_BLEND
+        * (output_hessian + _HESSIAN_DAMPING * eye[None])
+    ).reshape(-1, _HIF4_BLOCK_SIZE, _HIF4_BLOCK_SIZE)
     k_diagonal, k_factors = _factor_low_rank_hessian(
         k_hessian, _ATTENTION_K_HESSIAN_RANK
     )
@@ -1556,7 +1689,8 @@ def _calibrate_attention_smooth_v(
     k_state.update({
         "smooth_scale": kv_smooth.contiguous(),
         "smooth_alpha": smooth_alpha,
-        "algorithm": "hif4-k-only-precomputed-rank8",
+        "algorithm": "hif4-position-aware-k-output-hessian",
+        "position_buckets": _ATTENTION_K_POSITION_BUCKETS,
         "hessian_diagonal": k_diagonal.cpu().contiguous(),
         "hessian_factors": k_factors.cpu().contiguous(),
         "rotation": "full-head-signed-hadamard",
@@ -1982,15 +2116,32 @@ def hif4_dynamic_quantize_k(
         head_dim,
     )
     block_count = kv_num_heads * head_dim // _HIF4_BLOCK_SIZE
+    bucket_count = k_state.get("position_buckets") if type(k_state) is dict else None
+    if type(bucket_count) is not int or bucket_count <= 0:
+        raise ValueError("k_state must contain a positive position_buckets int")
     diagonal = _state_tensor(
         k_state,
         "hessian_diagonal",
-        (block_count, _HIF4_BLOCK_SIZE),
+        (bucket_count * block_count, _HIF4_BLOCK_SIZE),
     )
     factors = _state_tensor(
         k_state,
         "hessian_factors",
-        (block_count, _HIF4_BLOCK_SIZE, _ATTENTION_K_HESSIAN_RANK),
+        (
+            bucket_count * block_count,
+            _HIF4_BLOCK_SIZE,
+            _ATTENTION_K_HESSIAN_RANK,
+        ),
+    )
+    row_count = int(transformed.shape[0])
+    row_buckets = torch.div(
+        torch.arange(row_count) * bucket_count,
+        max(row_count, 1),
+        rounding_mode="floor",
+    ).clamp_max(bucket_count - 1)
+    hessian_indices = (
+        row_buckets[:, None] * block_count
+        + torch.arange(block_count)[None, :]
     )
     baseline = _quantize_hif4(transformed)
     return _quantize_hif4_low_rank_hessian(
@@ -2000,6 +2151,7 @@ def hif4_dynamic_quantize_k(
         precomputed_factors=(diagonal, factors),
         sweep_rounds=_ATTENTION_K_HESSIAN_SWEEPS,
         min_replace_improvement=_ATTENTION_K_HESSIAN_MIN_REPLACE_IMPROVEMENT,
+        hessian_indices=hessian_indices,
     )
 
 
