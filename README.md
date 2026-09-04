@@ -6,6 +6,8 @@ legal HiF4 parameters for Linear and Attention workloads.
 ## Files
 
 - `solution.py`: the six public contest APIs and quantization implementation.
+- `EXPERIMENT_LOG.md`: current-dataset online results, rejected ideas, runtime
+  limits, and promotion gates for future candidates.
 - `local_proxy_benchmark.py`: reproducible synthetic data generator and proxy
   scorer. It compares the demo with the paper-style peak conversion baseline.
 - `real_model_benchmark.py`: captures weights, activations, and Q/K/V tensors
