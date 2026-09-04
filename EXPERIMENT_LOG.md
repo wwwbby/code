@@ -96,6 +96,70 @@ hold:
   coordinate sweep over local hierarchy choices added roughly 2--4 seconds;
   strict row guards rejected nearly all changes, while relaxed guards reduced
   the Qwen Linear proxy from `0.41823` to `0.35103`. Both forms were removed.
+- A non-Hessian two-stage fixed butterfly rotation was tested on Linear while
+  leaving Attention unchanged. It preserved the floating-point operator and
+  added only about 0.6 local seconds, but all three Qwen layers regressed and
+  the mean proxy fell from `0.4182` to `0.4132`. One signed Hadamard stage is
+  retained; adding more distribution mixing is not assumed to be beneficial.
+- A calibration-derived lane permutation improved all three captured Qwen
+  Linear layers but reduced the nine-family synthetic mean and strongly hurt
+  correlated/low-rank families. It was rejected as a direct example of Qwen
+  overfitting.
+- A full-width power-of-two Linear Hadamard (H64 followed by block-axis
+  mixing) reduced the non-Qwen public Linear proxy from `0.75724` to `0.74174`
+  and regressed the multi-distribution matrix. HiF4's 64-value global-scale
+  boundary should remain aligned with the rotation boundary.
+- Rank-1/rank-2 calibration PCA Householder rotations were tested as a
+  non-Hessian replacement. They failed on heavy-tail and sparse-outlier
+  families because a few learned directions do not spread general outliers as
+  reliably as H64. They were removed.
+
+## Distribution-level Linear ablation
+
+`robust_linear_benchmark.py` covers iid, heavy-tail, one-sided heavy-tail,
+correlated, correlated-heavy-weight, channel-scale, sparse-outlier, and
+low-rank families at widths 256--1024. It can also consume the public Linear
+file and captured real-model bundles. The main finding is that no single
+mechanism dominates every distribution: diagonal Weight/Activation weighting
+is the safest generic path, Smooth handles channel heterogeneity, Hadamard
+handles unstructured tails, and low-rank Hessian refinement is valuable on
+model-like correlated data. The full current route remains best on both the
+non-Qwen public matrix (`0.75724`) and captured Qwen (`0.41823`), so Hessian is
+retained as an evidence-backed component rather than treated as the only
+research direction.
+
+## Current cross-validation candidate
+
+K refinement now searches against the full calibration Q covariance but
+accepts a changed block only when it also improves a rank-8 covariance built
+from alternating calibration samples. Validation is evaluated only for blocks
+that pass the primary guard. This permits lowering the primary improvement
+threshold from 10% to 5% without selecting calibration-fragile changes.
+
+- robust six-profile Attention: full `0.46303 -> 0.46463`, causal
+  `0.32948 -> 0.33090`, worst `0.03461 -> 0.06076`;
+- non-Qwen public Attention: full `0.30040 -> 0.30109`, causal
+  `0.29539 -> 0.29636`;
+- captured Qwen Attention: full `0.71723 -> 0.71675`, causal
+  `0.66891 -> 0.66870`.
+
+This candidate is intentionally selected by non-Qwen gains. It still requires
+the server result for promotion. The official check passed `22/22` in 26.8 s.
+
+The same cross-validation framework enables a bounded per-KV-head Smooth-QK
+selector over alpha `{0.25, 0.34375, 0.4375}`. It scores at most three 32-token
+calibration samples with the final Q/K quantizers, requires improvement on
+both alternating halves, and applies a logit guard. Unlike the rejected direct
+selector, its calibration objective includes the final K refinement.
+
+- robust six-profile Attention with selection: full `0.47213`, causal
+  `0.33617`, worst `0.06076`;
+- non-Qwen public Attention remains `0.30109/0.29636`;
+- captured Qwen improves slightly to `0.7181/0.6711`.
+
+The public Attention path added roughly 7--8 local seconds during calibration;
+the official full check remained inside the prior 25--29 second range. Dynamic
+quantization still executes only one selected path.
 
 ## Next research direction
 

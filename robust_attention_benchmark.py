@@ -120,11 +120,24 @@ def main() -> None:
     parser.add_argument("--revisions", nargs="+", default=["worktree"])
     parser.add_argument("--seed", type=int, default=20260904)
     parser.add_argument("--min-improvement", type=float)
+    parser.add_argument("--k-sweeps", type=int)
+    parser.add_argument("--k-rank", type=int)
+    parser.add_argument("--k-threshold", type=float)
+    parser.add_argument("--alpha", type=float)
     args = parser.parse_args()
     repo = Path(__file__).resolve().parent
     cases = [make_case(profile, args.seed + index) for index, profile in enumerate(PROFILES)]
     for revision in args.revisions:
         solution = load_solution(repo, revision)
+        if args.k_sweeps is not None:
+            solution._ATTENTION_K_HESSIAN_SWEEPS = args.k_sweeps
+        if args.k_rank is not None:
+            solution._ATTENTION_K_HESSIAN_RANK = args.k_rank
+        if args.k_threshold is not None:
+            solution._ATTENTION_K_HESSIAN_MIN_REPLACE_IMPROVEMENT = args.k_threshold
+        if args.alpha is not None:
+            solution._ATTENTION_SMOOTH_ALPHA = args.alpha
+            solution._ATTENTION_IMBALANCED_SMOOTH_ALPHA = args.alpha
         if args.min_improvement is not None and hasattr(
             solution, "_ATTENTION_ALPHA_SELECTION_MIN_IMPROVEMENT"
         ):

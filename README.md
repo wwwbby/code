@@ -15,6 +15,10 @@ legal HiF4 parameters for Linear and Attention workloads.
 - `attention_alpha_sweep.py`: checks whether calibration-derived Q/K balance
   and V-importance choices generalize across real layers.
 - `linear_rank_sweep.py`: measures the Linear low-rank/sweep quality frontier.
+- `robust_linear_benchmark.py`: compares Linear components across nine
+  distribution families, public data, and captured real-model data.
+- `robust_attention_benchmark.py`: covers MHA/GQA/MQA, head dimensions
+  64/128/256, short/long sequences, tails, and Q/K imbalance.
 - `attention_component_ablation.py`: isolates Q-only and K-only Hessian gains.
 - `attention_k_sweep.py`: measures K-Hessian rank, sweep, guard, and token caps.
 
@@ -38,12 +42,16 @@ sweep. The larger factor retains more Linear covariance at modest offline cost.
 
 Q and K use reciprocal per-channel smoothing followed by the same signed
 orthonormal Hadamard across the full attention head. Non-power-of-two heads
-retain the H64 fallback. Calibration builds only the Q covariance needed to
-score K error, factors it once to rank 8, and stores the small factors in
-`k_state`. Dynamic Q stays on the direct path; dynamic K performs two guarded
-local sweeps and accepts blocks with at least 10% covariance-loss reduction.
-This K-only design captures the useful part of the timed-out Q+K experiment
-without repeatedly factorizing Hessians or refining the much larger Q tensor.
+retain the H64 fallback. Calibration compares three conservative smoothing
+strengths per KV head on at most three 32-token samples, using the final Q/K
+quantizers and both causal/full output error. A candidate must improve both
+alternating calibration halves and pass a logit guard. Calibration also builds
+the Q covariance needed to score K error and an alternating-sample validation
+covariance, factors both once to rank 8, and stores the small factors in
+`k_state`. Dynamic Q stays on the direct path; dynamic K performs two local
+sweeps and accepts a 5%-better block only when the validation covariance also
+improves. Candidate selection remains calibration-only; the dynamic path runs
+only the selected alpha and does not perform a multi-candidate search.
 V uses a mild, compressed diagonal importance derived from bounded full/causal
 attention statistics and is still quantized only once.
 
