@@ -15,6 +15,7 @@ dataset and must not be used to predict the current leaderboard.
 | `b7248c6` | 16000 | not recorded | rejected | Timeout-safe adaptive Q/K and guarded V path |
 | `def4524` | **16775** | **242 s** | **online baseline** | Rank-32 Linear plus pre-factored K-only Hessian |
 | `097c2e5` | 16775 | 244 s | rejected | Rank-40/two sweeps plus position-aware output Hessian |
+| `e0a19b0` | 16700 | 250 s | rejected | Cross-validated K and per-KV-head alpha selection |
 
 `13a718a` is the explicit source rollback from rejected `097c2e5` to the
 `def4524` numerical path. The rejected implementation remains recoverable from
@@ -128,7 +129,7 @@ non-Qwen public matrix (`0.75724`) and captured Qwen (`0.41823`), so Hessian is
 retained as an evidence-backed component rather than treated as the only
 research direction.
 
-## Current cross-validation candidate
+## Rejected cross-validation candidate
 
 K refinement now searches against the full calibration Q covariance but
 accepts a changed block only when it also improves a rank-8 covariance built
@@ -143,8 +144,8 @@ threshold from 10% to 5% without selecting calibration-fragile changes.
 - captured Qwen Attention: full `0.71723 -> 0.71675`, causal
   `0.66891 -> 0.66870`.
 
-This candidate is intentionally selected by non-Qwen gains. It still requires
-the server result for promotion. The official check passed `22/22` in 26.8 s.
+This candidate was intentionally selected by non-Qwen gains. The official
+check passed `22/22` in 26.8 s.
 
 The same cross-validation framework enables a bounded per-KV-head Smooth-QK
 selector over alpha `{0.25, 0.34375, 0.4375}`. It scores at most three 32-token
@@ -158,14 +159,19 @@ selector, its calibration objective includes the final K refinement.
 - captured Qwen improves slightly to `0.7181/0.6711`.
 
 The public Attention path added roughly 7--8 local seconds during calibration;
-the official full check remained inside the prior 25--29 second range. Dynamic
-quantization still executes only one selected path.
+the official full check remained inside the prior 25--29 second range. Online,
+however, `e0a19b0` regressed from `16775/242 s` to `16700/250 s`. The runtime
+increase matched the local warning, while every local quality proxy predicted
+the wrong ordering. The candidate is therefore rejected and `solution.py` is
+restored to the `def4524` numerical path. Do not resume alpha selection or
+K-validation threshold tuning without a new server-correlated objective.
 
 ## Next research direction
 
 Keep the `def4524` runtime path and search for a structural improvement that is
-nearly free dynamically. The first target is a calibration-only, distribution-
-robust Q/K objective evaluated on a synthetic shape matrix. If it cannot beat
-the baseline across that matrix, move to low-rank cross-block Linear error
-compensation with strict row-level guards rather than increasing the existing
-within-block Hessian budget.
+nearly free dynamically. The next target must change the actual HiF4 coding or
+scale allocation rather than selecting among more calibration-fitted Attention
+paths. Prefer fixed transforms, codebook/scale phase choices, and mechanisms
+whose dynamic overhead is negligible. Treat all local Qwen, public, and
+synthetic scores as rejection tests only until a proxy is shown to preserve
+the ordering of multiple online submissions.

@@ -42,16 +42,12 @@ sweep. The larger factor retains more Linear covariance at modest offline cost.
 
 Q and K use reciprocal per-channel smoothing followed by the same signed
 orthonormal Hadamard across the full attention head. Non-power-of-two heads
-retain the H64 fallback. Calibration compares three conservative smoothing
-strengths per KV head on at most three 32-token samples, using the final Q/K
-quantizers and both causal/full output error. A candidate must improve both
-alternating calibration halves and pass a logit guard. Calibration also builds
-the Q covariance needed to score K error and an alternating-sample validation
-covariance, factors both once to rank 8, and stores the small factors in
-`k_state`. Dynamic Q stays on the direct path; dynamic K performs two local
-sweeps and accepts a 5%-better block only when the validation covariance also
-improves. Candidate selection remains calibration-only; the dynamic path runs
-only the selected alpha and does not perform a multi-candidate search.
+retain the H64 fallback. Calibration builds only the Q covariance needed to
+score K error, factors it once to rank 8, and stores the small factors in
+`k_state`. Dynamic Q stays on the direct path; dynamic K performs two guarded
+local sweeps and accepts blocks with at least 10% covariance-loss reduction.
+This K-only design captures the useful part of the timed-out Q+K experiment
+without repeatedly factorizing Hessians or refining the much larger Q tensor.
 V uses a mild, compressed diagonal importance derived from bounded full/causal
 attention statistics and is still quantized only once.
 
@@ -90,9 +86,11 @@ self-check time enough to fund covariance-aware Q/K and guarded V refinement.
 The later `237b142` Q+K Attention-Hessian experiment timed out on the contest
 server. Component ablation found that Q-only refinement provided essentially no
 gain, while K-only refinement slightly exceeded Q+K on the captured model. The
-last submitted `b7248c6` revision remained at `16000` points; this revision is a
-new hidden-set candidate, and the contest server remains authoritative for its
-score and runtime.
+best verified revision is `def4524` at `16775` points in `242 s`. The later
+cross-validated alpha/K candidate `e0a19b0` regressed to `16700` points in
+`250 s` despite improving all local proxy groups, so the implementation has
+been restored to the `def4524` numerical path. The contest server remains the
+only authoritative source for score and runtime ordering.
 
 ## Run the proxy benchmark
 
