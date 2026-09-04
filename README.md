@@ -30,18 +30,15 @@ For every 64-value HiF4 block, the implementation:
 Linear calibration applies reciprocal SmoothQuant-style scaling and a shared
 signed H64 transform to weights and activations. Weight scale selection uses
 activation second moments. Dynamic activation search is weighted by the
-transformed weight's output sensitivity. A rank-40 Hessian pass then keeps each
-block's refined global scale fixed and performs two guarded local coordinate
-sweeps. This spends part of the measured server headroom on the most reliable
-remaining Linear improvement without approaching the full-rank cost.
+transformed weight's output sensitivity. A rank-32 Hessian pass then keeps each
+block's refined global scale fixed and performs one guarded local coordinate
+sweep. The larger factor retains more Linear covariance at modest offline cost.
 
 Q and K use reciprocal per-channel smoothing followed by the same signed
 orthonormal Hadamard across the full attention head. Non-power-of-two heads
-retain the H64 fallback. Calibration mixes the Q covariance used to score K
-error with a 25% Attention-output curvature estimate using softmax probabilities
-and V. Early and late K positions use two broad buckets; finer bucketing overfit
-the small calibration set. The Hessians are factored once to rank 8 and stored
-in `k_state`. Dynamic Q stays on the direct path; dynamic K performs two guarded
+retain the H64 fallback. Calibration builds only the Q covariance needed to
+score K error, factors it once to rank 8, and stores the small factors in
+`k_state`. Dynamic Q stays on the direct path; dynamic K performs two guarded
 local sweeps and accepts blocks with at least 10% covariance-loss reduction.
 This K-only design captures the useful part of the timed-out Q+K experiment
 without repeatedly factorizing Hessians or refining the much larger Q tensor.
@@ -62,14 +59,15 @@ On the organizer's public mini sample:
 - official output-format checks: `22/22` passed;
 - Linear output NMSE cases: `0.00025638`, `0.00031286`, `0.00028422`,
   `0.00031588`, `0.00028812` (mean `0.00029149`);
-- Attention proxy score over the five public tests: `0.30005` versus `0.25944`
+- Attention proxy score over the five public tests: `0.30040` versus `0.25944`
   for `b7248c6`;
-- Linear proxy score: `0.75820` versus `0.75724` for `def4524`;
-- full public proxy runtime remains below the estimated 300-second server limit.
+- combined ten-test proxy score: `5.28822` versus `5.08173` for `b7248c6`;
+- full self-check runtime on the development machine: typically `25-29 s`.
 
-On three captured `Qwen2.5-0.5B` layers, position-aware K refinement reaches
-mean full/causal improvements of `72.02%`/`67.52%`. Linear rank-40 with two
-sweeps raises the corresponding Linear proxy from `41.82%` to `42.70%`.
+On three captured `Qwen2.5-0.5B` layers, the K-only refinement raises mean
+full-attention improvement over plain HiF4 from `10.83%` to `71.72%` and causal
+improvement from `22.85%` to `66.89%`. Linear rank-32 raises the corresponding
+Linear proxy from `40.11%` to `41.82%`.
 
 The local-scale solver algebraically reduces eight hierarchy combinations to
 three effective total scales while preserving the original tie breaks. The
@@ -82,10 +80,9 @@ self-check time enough to fund covariance-aware Q/K and guarded V refinement.
 The later `237b142` Q+K Attention-Hessian experiment timed out on the contest
 server. Component ablation found that Q-only refinement provided essentially no
 gain, while K-only refinement slightly exceeded Q+K on the captured model. The
-submitted `def4524` revision scored `16775` points in `242 s`, improving on
-`b7248c6` at `16000` while also reducing runtime. This revision deliberately
-uses part of the resulting headroom; the contest server remains authoritative
-for its score and runtime.
+last submitted `b7248c6` revision remained at `16000` points; this revision is a
+new hidden-set candidate, and the contest server remains authoritative for its
+score and runtime.
 
 ## Run the proxy benchmark
 
