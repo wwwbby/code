@@ -34,7 +34,10 @@ def main() -> None:
     parser.add_argument("--public-datasets-dir")
     parser.add_argument("--use-calibration-as-test", action="store_true")
     parser.add_argument("--disable-attention-hessian", action="store_true")
+    parser.add_argument("--disable-adaptive-alpha", action="store_true")
     parser.add_argument("--show-stats", action="store_true")
+    parser.add_argument("--weight-powers", nargs="+", type=float, default=[0.25])
+    parser.add_argument("--v-blends", nargs="+", type=float, default=[0.5])
     parser.add_argument(
         "--alphas",
         nargs="+",
@@ -71,25 +74,36 @@ def main() -> None:
                 )
             print(f"stats {case['name']}: " + " ".join(fields))
     for alpha in args.alphas:
-        solution = load_solution(repo, "worktree")
-        solution._ATTENTION_SMOOTH_ALPHA = alpha
-        if args.disable_attention_hessian:
-            solution._ATTENTION_HESSIAN_MIN_REPLACE_IMPROVEMENT = float("inf")
-        results = []
-        for original in cases:
-            case = copy.copy(original)
-            case["linear"] = tiny_linear
-            if args.use_calibration_as_test:
-                case["attention"] = copy.copy(original["attention"])
-                case["attention"]["test"] = original["attention"]["calib"]
-            result = evaluate_case(solution, case)
-            results.append(result)
-        full = sum(item["attention_full"] for item in results) / len(results)
-        causal = sum(item["attention_causal"] for item in results) / len(results)
-        layers = ", ".join(
-            f"{item['attention_full']:+.4f}" for item in results
-        )
-        print(f"alpha={alpha:.4f} full={full:+.4f} causal={causal:+.4f} layers=[{layers}]")
+        for weight_power in args.weight_powers:
+            for v_blend in args.v_blends:
+                solution = load_solution(repo, "worktree")
+                solution._ATTENTION_SMOOTH_ALPHA = alpha
+                solution._V_IMPORTANCE_POWER = weight_power
+                solution._V_IMPORTANCE_BLEND = v_blend
+                if args.disable_adaptive_alpha:
+                    solution._ATTENTION_KQ_RMS_RATIO_THRESHOLD = float("inf")
+                if args.disable_attention_hessian:
+                    solution._ATTENTION_HESSIAN_MIN_REPLACE_IMPROVEMENT = float("inf")
+                results = []
+                for original in cases:
+                    case = copy.copy(original)
+                    case["linear"] = tiny_linear
+                    if args.use_calibration_as_test:
+                        case["attention"] = copy.copy(original["attention"])
+                        case["attention"]["test"] = original["attention"]["calib"]
+                    result = evaluate_case(solution, case)
+                    results.append(result)
+                full = sum(item["attention_full"] for item in results) / len(results)
+                causal = sum(item["attention_causal"] for item in results) / len(results)
+                layers = ", ".join(
+                    f"{item['attention_full']:+.4f}/{item['attention_causal']:+.4f}"
+                    for item in results
+                )
+                print(
+                    f"alpha={alpha:.4f} v_power={weight_power:.4f} "
+                    f"v_blend={v_blend:.3f} full={full:+.4f} causal={causal:+.4f} "
+                    f"layers=[{layers}]"
+                )
 
 
 if __name__ == "__main__":

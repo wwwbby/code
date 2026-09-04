@@ -40,11 +40,16 @@ _HIF4_BLOCK_SIZE = 64
 _NVFP4_BLOCK_SIZE = 16
 _SEARCH_CHUNK_BLOCKS = 4096
 _LINEAR_SMOOTH_ALPHA = 0.65
-# Balanced Q/K tensors prefer this stronger exponent; strongly K-dominant
-# real-model layers use the lower fallback selected from calibration RMS.
 _ATTENTION_SMOOTH_ALPHA = 0.4375
 _ATTENTION_IMBALANCED_SMOOTH_ALPHA = 0.25
 _ATTENTION_KQ_RMS_RATIO_THRESHOLD = 2.0
+_V_IMPORTANCE_MAX_QUERY_POSITIONS = 32
+_V_IMPORTANCE_POWER = 0.125
+_V_IMPORTANCE_BLEND = 0.25
+_ATTENTION_K_HESSIAN_MAX_TOKENS = 64
+_ATTENTION_K_HESSIAN_RANK = 8
+_ATTENTION_K_HESSIAN_SWEEPS = 2
+_ATTENTION_K_HESSIAN_MIN_REPLACE_IMPROVEMENT = 0.10
 _SMOOTH_SCALE_MIN = 1.0 / 16.0
 _SMOOTH_SCALE_MAX = 16.0
 
@@ -77,7 +82,7 @@ _HESSIAN_DAMPING = 0.01
 _HESSIAN_SWEEP_ROUNDS = 2
 _HESSIAN_CHUNK_BLOCKS = 8192
 _HESSIAN_MIN_REPLACE_IMPROVEMENT = 0.01
-_HESSIAN_LOW_RANK = 8
+_HESSIAN_LOW_RANK = 32
 _HESSIAN_LOW_RANK_SWEEPS = 1
 
 
@@ -652,12 +657,15 @@ def _build_block_hessian_reg(
 
 def _factor_low_rank_hessian(
     hessian_reg: torch.Tensor,
+    rank: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return an exact diagonal plus a rank-r covariance correction."""
 
+    if rank is None:
+        rank = _HESSIAN_LOW_RANK
     eigenvalues, eigenvectors = torch.linalg.eigh(hessian_reg)
-    values = eigenvalues[:, -_HESSIAN_LOW_RANK:].clamp_min(0.0)
-    vectors = eigenvectors[:, :, -_HESSIAN_LOW_RANK:]
+    values = eigenvalues[:, -rank:].clamp_min(0.0)
+    vectors = eigenvectors[:, :, -rank:]
     factors = vectors * values.sqrt()[:, None, :]
     residual_diagonal = (
         torch.diagonal(hessian_reg, dim1=-2, dim2=-1)
@@ -1106,8 +1114,11 @@ def _quantize_hif4_hessian_lite(
 
 def _quantize_hif4_low_rank_hessian(
     values: torch.Tensor,
-    hessian_reg: torch.Tensor,
+    hessian_reg: torch.Tensor | None,
     baseline: dict[str, torch.Tensor],
+    precomputed_factors: tuple[torch.Tensor, torch.Tensor] | None = None,
+    sweep_rounds: int | None = None,
+    min_replace_improvement: float | None = None,
 ) -> dict[str, torch.Tensor]:
     """Refine local scales under an exact-diagonal plus rank-r Hessian."""
 
@@ -1116,7 +1127,16 @@ def _quantize_hif4_low_rank_hessian(
     total_blocks = rows * block_count
     block_values = values.reshape(rows, block_count, 64).reshape(-1, 64)
     block_index = torch.arange(total_blocks, device=values.device) % block_count
-    diagonal, factors = _factor_low_rank_hessian(hessian_reg)
+    if precomputed_factors is None:
+        if hessian_reg is None:
+            raise ValueError("hessian_reg is required without precomputed factors")
+        diagonal, factors = _factor_low_rank_hessian(hessian_reg)
+    else:
+        diagonal, factors = precomputed_factors
+    if sweep_rounds is None:
+        sweep_rounds = _HESSIAN_LOW_RANK_SWEEPS
+    if min_replace_improvement is None:
+        min_replace_improvement = _HESSIAN_MIN_REPLACE_IMPROVEMENT
     flat_baseline = {
         key: tensor.reshape(total_blocks, *tensor.shape[2:])
         for key, tensor in baseline.items()
@@ -1158,7 +1178,7 @@ def _quantize_hif4_low_rank_hessian(
         )
         cache = _combo_cache(batch.abs(), torch.sign(batch), scale)
 
-        for _ in range(_HESSIAN_LOW_RANK_SWEEPS):
+        for _ in range(sweep_rounds):
             for group in range(8):
                 group_start = group * 8
                 group_end = group_start + 8
@@ -1226,9 +1246,7 @@ def _quantize_hif4_low_rank_hessian(
             "sign": sign,
             "mant": mantissa,
         }
-        use_improved = loss < baseline_loss * (
-            1.0 - _HESSIAN_MIN_REPLACE_IMPROVEMENT
-        )
+        use_improved = loss < baseline_loss * (1.0 - min_replace_improvement)
         condition = use_improved.reshape(batch_size, 1, 1, 1)
         for key in output:
             output[key][start:end] = torch.where(
@@ -1273,11 +1291,90 @@ def _apply_attention_hadamard(
     num_heads: int,
     head_dim: int,
 ) -> torch.Tensor:
-    """Apply identical block transforms inside every attention head."""
+    """Apply one shared signed orthonormal transform across each full head."""
 
     original_shape = tuple(x.shape)
-    per_head = x.reshape(-1, num_heads, head_dim).reshape(-1, head_dim)
-    return _apply_block_hadamard(per_head).reshape(original_shape)
+    if head_dim < _HIF4_BLOCK_SIZE or head_dim & (head_dim - 1):
+        per_head = x.reshape(-1, num_heads, head_dim).reshape(-1, head_dim)
+        return _apply_block_hadamard(per_head).reshape(original_shape)
+    y = x.to(torch.float32).reshape(-1, num_heads, head_dim)
+    signs = _block_signs64(head_dim // _HIF4_BLOCK_SIZE, y.device).reshape(head_dim)
+    y = y * signs
+    width = 1
+    while width < head_dim:
+        groups = y.reshape(*y.shape[:-1], -1, 2 * width)
+        left = groups[..., :width]
+        right = groups[..., width:]
+        y = torch.cat((left + right, left - right), dim=-1).reshape(*y.shape)
+        width *= 2
+    return (y * (float(head_dim) ** -0.5)).reshape(original_shape)
+
+
+def _attention_v_statistics(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_num_heads: int,
+    kv_num_heads: int,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Accumulate the diagonal V-output sensitivity for one sample."""
+
+    length = int(q.shape[0])
+    q_heads = q.reshape(length, q_num_heads, head_dim).permute(1, 0, 2)
+    k_heads = k.reshape(length, kv_num_heads, head_dim).permute(1, 0, 2)
+    v_energy = v.reshape(length, kv_num_heads, head_dim).permute(1, 0, 2).square()
+    if length > _V_IMPORTANCE_MAX_QUERY_POSITIONS:
+        positions = torch.linspace(
+            0,
+            length - 1,
+            steps=_V_IMPORTANCE_MAX_QUERY_POSITIONS,
+            dtype=torch.float32,
+        ).round().to(torch.int64)
+    else:
+        positions = torch.arange(length, dtype=torch.int64)
+    key_positions = torch.arange(length, dtype=torch.int64)
+    q_per_kv = q_num_heads // kv_num_heads
+    energy = torch.zeros((kv_num_heads, head_dim), dtype=torch.float32)
+    usage_total = torch.zeros((kv_num_heads, 1), dtype=torch.float32)
+    for head in range(kv_num_heads):
+        queries = q_heads[
+            head * q_per_kv:(head + 1) * q_per_kv,
+            positions,
+        ].to(torch.float32)
+        logits = queries @ k_heads[head].to(torch.float32).T
+        logits = logits * (float(head_dim) ** -0.5)
+        full = torch.softmax(logits, dim=-1)
+        causal_mask = key_positions[None, :] <= positions[:, None]
+        causal = torch.softmax(
+            logits.masked_fill(~causal_mask[None], float("-inf")), dim=-1
+        )
+        usage = 0.5 * (
+            full.square().sum(dim=(0, 1))
+            + causal.square().sum(dim=(0, 1))
+        )
+        energy[head] = (usage[:, None] * v_energy[head]).sum(dim=0)
+        usage_total[head, 0] = usage.sum()
+    return energy, usage_total
+
+
+def _finalize_v_importance(
+    weighted_energy: torch.Tensor,
+    usage_total: torch.Tensor,
+) -> torch.Tensor:
+    relative = weighted_energy / usage_total.clamp_min(1.0e-8)
+    median = relative.median(dim=-1, keepdim=True).values
+    compressed = (
+        (relative / median.clamp_min(1.0e-8))
+        .clamp(min=0.25, max=4.0)
+        .pow(_V_IMPORTANCE_POWER)
+    )
+    importance = 1.0 - _V_IMPORTANCE_BLEND + _V_IMPORTANCE_BLEND * compressed
+    blocks = importance.reshape(-1, _HIF4_BLOCK_SIZE)
+    blocks = blocks / blocks.mean(dim=-1, keepdim=True).clamp_min(1.0e-8)
+    return torch.nan_to_num(
+        blocks.reshape_as(importance), nan=1.0, posinf=1.0, neginf=1.0
+    ).cpu().contiguous()
 
 
 def _smooth_scale(
@@ -1336,6 +1433,144 @@ def _validate_attention_shape(
             f"{role}: hidden size {quant_float.shape[-1]} does not match "
             f"num_heads * head_dim ({expected_hidden})"
         )
+
+
+def _calibrate_attention_smooth_v(
+    calib_qkv_list: list,
+    q_num_heads: int,
+    kv_num_heads: int,
+    head_dim: int,
+) -> dict[str, Any]:
+    q_abs_max = torch.zeros((q_num_heads, head_dim), dtype=torch.float32)
+    k_abs_max = torch.zeros((kv_num_heads, head_dim), dtype=torch.float32)
+    q_square_sum = torch.zeros((), dtype=torch.float32)
+    k_square_sum = torch.zeros((), dtype=torch.float32)
+    q_element_count = 0
+    k_element_count = 0
+    v_weighted_energy = torch.zeros((kv_num_heads, head_dim), dtype=torch.float32)
+    v_usage_total = torch.zeros((kv_num_heads, 1), dtype=torch.float32)
+    calibration_q: list[torch.Tensor] = []
+    for sample in calib_qkv_list:
+        if type(sample) is not dict:
+            raise ValueError("each attention calibration sample must be a dict")
+        q_quant, q_scale = sample["q"]
+        k_quant, k_scale = sample["k"]
+        v_quant, v_scale = sample["v"]
+        q = _dequantize_nvfp4_fp32(q_quant, q_scale)
+        k = _dequantize_nvfp4_fp32(k_quant, k_scale)
+        v = _dequantize_nvfp4_fp32(v_quant, v_scale)
+        calibration_q.append(q)
+        _validate_attention_shape(q_quant, q_num_heads, head_dim, "q calibration")
+        _validate_attention_shape(k_quant, kv_num_heads, head_dim, "k calibration")
+        _validate_attention_shape(v_quant, kv_num_heads, head_dim, "v calibration")
+        q_abs_max = torch.maximum(
+            q_abs_max,
+            q.reshape(-1, q_num_heads, head_dim).abs().amax(dim=0).cpu(),
+        )
+        k_abs_max = torch.maximum(
+            k_abs_max,
+            k.reshape(-1, kv_num_heads, head_dim).abs().amax(dim=0).cpu(),
+        )
+        q_flat = q.reshape(-1)
+        k_flat = k.reshape(-1)
+        q_square_sum += torch.dot(q_flat, q_flat).cpu()
+        k_square_sum += torch.dot(k_flat, k_flat).cpu()
+        q_element_count += q.numel()
+        k_element_count += k.numel()
+        sample_energy, sample_usage = _attention_v_statistics(
+            q, k, v, q_num_heads, kv_num_heads, head_dim
+        )
+        v_weighted_energy += sample_energy.cpu()
+        v_usage_total += sample_usage.cpu()
+
+    q_rms = (q_square_sum / max(q_element_count, 1)).sqrt()
+    k_rms = (k_square_sum / max(k_element_count, 1)).sqrt()
+    kq_rms_ratio = float(k_rms / q_rms.clamp_min(1.0e-12))
+    smooth_alpha = (
+        _ATTENTION_IMBALANCED_SMOOTH_ALPHA
+        if kq_rms_ratio > _ATTENTION_KQ_RMS_RATIO_THRESHOLD
+        else _ATTENTION_SMOOTH_ALPHA
+    )
+    q_per_kv = q_abs_max.reshape(
+        kv_num_heads, q_num_heads // kv_num_heads, head_dim
+    ).amax(dim=1)
+    kv_smooth = _smooth_scale(q_per_kv, k_abs_max, smooth_alpha).cpu()
+    q_smooth = kv_smooth[:, None, :].expand(
+        kv_num_heads, q_num_heads // kv_num_heads, head_dim
+    ).reshape(q_num_heads, head_dim).contiguous()
+
+    # K has far fewer rows than Q in grouped-query attention, yet its error is
+    # seen by every mapped Q head.  Build only this high-value opposite-side
+    # covariance and factor it once during calibration.
+    head_blocks = head_dim // _HIF4_BLOCK_SIZE
+    q_covariance = torch.zeros(
+        (q_num_heads, head_blocks, _HIF4_BLOCK_SIZE, _HIF4_BLOCK_SIZE),
+        dtype=torch.float32,
+    )
+    covariance_tokens = 0
+    for q in calibration_q:
+        token_count = int(q.shape[0])
+        if token_count > _ATTENTION_K_HESSIAN_MAX_TOKENS:
+            positions = torch.linspace(
+                0,
+                token_count - 1,
+                steps=_ATTENTION_K_HESSIAN_MAX_TOKENS,
+                dtype=torch.float32,
+            ).round().to(torch.int64)
+            q = q[positions]
+        q_transformed = _apply_attention_hadamard(
+            (q.reshape(-1, q_num_heads, head_dim) / q_smooth).reshape_as(q),
+            q_num_heads,
+            head_dim,
+        ).reshape(-1, q_num_heads, head_blocks, _HIF4_BLOCK_SIZE)
+        q_covariance += torch.einsum(
+            "thbi,thbj->hbij", q_transformed, q_transformed
+        ).cpu()
+        covariance_tokens += int(q_transformed.shape[0])
+    q_per_kv_count = q_num_heads // kv_num_heads
+    k_hessian = q_covariance.reshape(
+        kv_num_heads,
+        q_per_kv_count,
+        head_blocks,
+        _HIF4_BLOCK_SIZE,
+        _HIF4_BLOCK_SIZE,
+    ).mean(dim=1) / max(covariance_tokens, 1)
+    k_hessian = k_hessian.reshape(-1, _HIF4_BLOCK_SIZE, _HIF4_BLOCK_SIZE)
+    trace = torch.diagonal(k_hessian, dim1=-2, dim2=-1).sum(dim=-1)
+    normalization = (trace / float(_HIF4_BLOCK_SIZE)).clamp_min(1.0e-8)
+    eye = torch.eye(_HIF4_BLOCK_SIZE, dtype=torch.float32)[None]
+    k_hessian = (
+        k_hessian / normalization[:, None, None] + _HESSIAN_DAMPING * eye
+    )
+    k_diagonal, k_factors = _factor_low_rank_hessian(
+        k_hessian, _ATTENTION_K_HESSIAN_RANK
+    )
+
+    q_state = _make_state("q")
+    q_state.update({
+        "smooth_scale": q_smooth,
+        "smooth_alpha": smooth_alpha,
+        "rotation": "full-head-signed-hadamard",
+    })
+    k_state = _make_state("k")
+    k_state.update({
+        "smooth_scale": kv_smooth.contiguous(),
+        "smooth_alpha": smooth_alpha,
+        "algorithm": "hif4-k-only-precomputed-rank8",
+        "hessian_diagonal": k_diagonal.cpu().contiguous(),
+        "hessian_factors": k_factors.cpu().contiguous(),
+        "rotation": "full-head-signed-hadamard",
+    })
+    v_state = _make_state("v")
+    v_state.update({
+        "algorithm": "hif4-single-pass-weighted-v",
+        "calibration_used": True,
+        "rotation": "none",
+        "error_weights": _finalize_v_importance(
+            v_weighted_energy, v_usage_total
+        ),
+    })
+    return {"q_state": q_state, "k_state": k_state, "v_state": v_state}
 
 
 # =============================================================================
@@ -1643,77 +1878,10 @@ def hif4_calibration_attention(
     if q_num_heads % kv_num_heads != 0:
         raise ValueError("q_num_heads must be divisible by kv_num_heads")
 
-    q_abs_max = torch.zeros((q_num_heads, head_dim), dtype=torch.float32)
-    k_abs_max = torch.zeros((kv_num_heads, head_dim), dtype=torch.float32)
-    q_square_sum = torch.zeros((), dtype=torch.float32)
-    k_square_sum = torch.zeros((), dtype=torch.float32)
-    q_element_count = 0
-    k_element_count = 0
-    for sample in calib_qkv_list:
-        if type(sample) is not dict:
-            raise ValueError("each attention calibration sample must be a dict")
-        q_quant, q_scale = sample["q"]
-        k_quant, k_scale = sample["k"]
-        q = _dequantize_nvfp4_fp32(q_quant, q_scale)
-        k = _dequantize_nvfp4_fp32(k_quant, k_scale)
-        _validate_attention_shape(q_quant, q_num_heads, head_dim, "q calibration")
-        _validate_attention_shape(k_quant, kv_num_heads, head_dim, "k calibration")
-        q_abs_max = torch.maximum(
-            q_abs_max,
-            q.reshape(-1, q_num_heads, head_dim).abs().amax(dim=0).cpu(),
-        )
-        k_abs_max = torch.maximum(
-            k_abs_max,
-            k.reshape(-1, kv_num_heads, head_dim).abs().amax(dim=0).cpu(),
-        )
-        q_flat = q.reshape(-1)
-        k_flat = k.reshape(-1)
-        q_square_sum += torch.dot(q_flat, q_flat).cpu()
-        k_square_sum += torch.dot(k_flat, k_flat).cpu()
-        q_element_count += q.numel()
-        k_element_count += k.numel()
-
-    q_rms = (q_square_sum / max(q_element_count, 1)).sqrt()
-    k_rms = (k_square_sum / max(k_element_count, 1)).sqrt()
-    kq_rms_ratio = float(k_rms / q_rms.clamp_min(1.0e-12))
-    smooth_alpha = (
-        _ATTENTION_IMBALANCED_SMOOTH_ALPHA
-        if kq_rms_ratio > _ATTENTION_KQ_RMS_RATIO_THRESHOLD
-        else _ATTENTION_SMOOTH_ALPHA
+    return _calibrate_attention_smooth_v(
+        calib_qkv_list, q_num_heads, kv_num_heads, head_dim
     )
 
-    q_per_kv = q_abs_max.reshape(
-        kv_num_heads,
-        q_num_heads // kv_num_heads,
-        head_dim,
-    ).amax(dim=1)
-    kv_smooth = _smooth_scale(
-        q_per_kv,
-        k_abs_max,
-        smooth_alpha,
-    ).cpu()
-    q_smooth = kv_smooth[:, None, :].expand(
-        kv_num_heads,
-        q_num_heads // kv_num_heads,
-        head_dim,
-    ).reshape(q_num_heads, head_dim).contiguous()
-
-    q_state = _make_state("q")
-    q_state.update({
-        "smooth_scale": q_smooth,
-        "smooth_alpha": smooth_alpha,
-        "rotation": "per-head-signed-hadamard-64",
-    })
-    k_state = _make_state("k")
-    k_state.update({
-        "smooth_scale": kv_smooth.contiguous(),
-        "smooth_alpha": smooth_alpha,
-        "rotation": "per-head-signed-hadamard-64",
-    })
-    v_state = _make_state("v")
-    v_state["calibration_used"] = False
-    v_state["rotation"] = "none"
-    return {"q_state": q_state, "k_state": k_state, "v_state": v_state}
 
 
 # =============================================================================
@@ -1813,7 +1981,26 @@ def hif4_dynamic_quantize_k(
         kv_num_heads,
         head_dim,
     )
-    return _quantize_hif4(transformed)
+    block_count = kv_num_heads * head_dim // _HIF4_BLOCK_SIZE
+    diagonal = _state_tensor(
+        k_state,
+        "hessian_diagonal",
+        (block_count, _HIF4_BLOCK_SIZE),
+    )
+    factors = _state_tensor(
+        k_state,
+        "hessian_factors",
+        (block_count, _HIF4_BLOCK_SIZE, _ATTENTION_K_HESSIAN_RANK),
+    )
+    baseline = _quantize_hif4(transformed)
+    return _quantize_hif4_low_rank_hessian(
+        transformed,
+        None,
+        baseline,
+        precomputed_factors=(diagonal, factors),
+        sweep_rounds=_ATTENTION_K_HESSIAN_SWEEPS,
+        min_replace_improvement=_ATTENTION_K_HESSIAN_MIN_REPLACE_IMPROVEMENT,
+    )
 
 
 # =============================================================================
@@ -1850,6 +2037,11 @@ def hif4_dynamic_quantize_v(
     Returns:
         当前 V 对应的 HiF4Params。
     """
-    _ = v_state
     _validate_attention_shape(v_quant, kv_num_heads, head_dim, "v")
-    return _quantize_nvfp4_pair(v_quant, v_scale)
+    error_weights = _state_tensor(
+        v_state,
+        "error_weights",
+        (kv_num_heads, head_dim),
+    )
+    v = _dequantize_nvfp4_fp32(v_quant, v_scale)
+    return _quantize_hif4(v, error_weights.reshape(-1))
