@@ -2045,3 +2045,148 @@ def hif4_dynamic_quantize_v(
     )
     v = _dequantize_nvfp4_fp32(v_quant, v_scale)
     return _quantize_hif4(v, error_weights.reshape(-1))
+
+# Append this research extension to the pinned baseline solution.py.
+# Configuration is set by the experiment loader, not by test-set identities.
+_K_CENTER_MODE = "guarded"  # off / always / guarded
+_K_MANTISSA_STRENGTH = 0.0
+_K_CENTER_CALIB_SAMPLES = 3
+_K_CENTER_CALIB_TOKENS = 128
+_K_CENTER_IMPROVEMENT = 0.05
+_K_CENTER_MAX_SAMPLE_REGRESSION = 0.05
+_K_BASE_CALIBRATION = hif4_calibration_attention
+_K_BASE_DYNAMIC = hif4_dynamic_quantize_k
+
+
+def _k_reconstruct(params, shape):
+    return (params['sign'].float() * params['mant'].float()
+            * params['scale_lv3'].float() * params['scale_lv2'].float()
+            * params['scale_factor'].float()).reshape(shape)
+
+
+def _k_mantissa_refine(values, params, diagonal, factors, strength):
+    rows, channels = values.shape
+    blocks = channels // 64
+    exact_diagonal = diagonal + factors.square().sum(-1)
+    factors = factors * (strength ** 0.5)
+    diagonal = exact_diagonal - factors.square().sum(-1)
+    recon = _k_reconstruct(params, values.shape).reshape(-1, 64)
+    source = values.reshape(-1, 64)
+    step = ((params['scale_factor'] * params['scale_lv2']
+             * params['scale_lv3']) / 4).expand_as(params['mant']).reshape(-1, 64)
+    optimized = recon.clone()
+    for start in range(0, len(recon), _HESSIAN_CHUNK_BLOCKS):
+        end = min(start + _HESSIAN_CHUNK_BLOCKS, len(recon))
+        index = torch.arange(start, end, device=values.device) % blocks
+        d, u = diagonal[index], factors[index]
+        y = recon[start:end].clone()
+        error = source[start:end] - y
+        projected = torch.bmm(error[:, None, :], u).squeeze(1)
+        old_loss = (d * error.square()).sum(-1) + projected.square().sum(-1)
+        for lane in range(64):
+            ui = u[:, lane, :]
+            hii = d[:, lane] + ui.square().sum(-1)
+            he = d[:, lane] * error[:, lane] + (projected * ui).sum(-1)
+            quantum = step[start:end, lane]
+            target = y[:, lane] + he / hii.clamp_min(1e-12)
+            candidate = (target / quantum).round().clamp(-7, 7) * quantum
+            delta = candidate - y[:, lane]
+            improvement = delta.square() * hii - 2 * delta * he
+            delta = torch.where(improvement < 0, delta, 0.)
+            y[:, lane] += delta
+            error[:, lane] -= delta
+            projected -= delta[:, None] * ui
+        error = source[start:end] - y
+        projected = torch.bmm(error[:, None, :], u).squeeze(1)
+        loss = (d * error.square()).sum(-1) + projected.square().sum(-1)
+        optimized[start:end] = torch.where((loss < old_loss * .99)[:, None], y, recon[start:end])
+    code = (optimized / step).round().clamp(-7, 7).reshape_as(params['mant'])
+    output = dict(params)
+    output['sign'] = code.sign().contiguous()
+    output['mant'] = (code.abs() / 4).contiguous()
+    return output
+
+
+def _k_quantize_value(k, heads, dim, state, center_mask):
+    if center_mask is not None and bool(center_mask.any()):
+        values = k.reshape(-1, heads, dim)
+        k = (values - values.mean(0, keepdim=True) * center_mask[None, :, None]).reshape_as(k)
+    smooth = _state_tensor(state, 'smooth_scale', (heads, dim))
+    transformed = _apply_attention_hadamard(
+        (k.reshape(-1, heads, dim) * smooth).reshape_as(k), heads, dim)
+    block_count = heads * dim // 64
+    diagonal = _state_tensor(state, 'hessian_diagonal', (block_count, 64))
+    factors = _state_tensor(state, 'hessian_factors', (block_count, 64, _ATTENTION_K_HESSIAN_RANK))
+    baseline = _quantize_hif4(transformed)
+    params = _quantize_hif4_low_rank_hessian(
+        transformed, None, baseline, precomputed_factors=(diagonal, factors),
+        sweep_rounds=_ATTENTION_K_HESSIAN_SWEEPS,
+        min_replace_improvement=_ATTENTION_K_HESSIAN_MIN_REPLACE_IMPROVEMENT)
+    if _K_MANTISSA_STRENGTH > 0:
+        params = _k_mantissa_refine(transformed, params, diagonal, factors, _K_MANTISSA_STRENGTH)
+    return params
+
+
+def _k_calibration_attention(q, k, v, q_heads, kv_heads, dim, causal):
+    length = q.shape[0]
+    qh = q.reshape(length, q_heads, dim).transpose(0, 1)
+    kh = k.reshape(length, kv_heads, dim).transpose(0, 1).repeat_interleave(q_heads // kv_heads, 0)
+    vh = v.reshape(length, kv_heads, dim).transpose(0, 1).repeat_interleave(q_heads // kv_heads, 0)
+    logits = (qh @ kh.transpose(-1, -2)) * (dim ** -0.5)
+    if causal:
+        logits = logits.masked_fill(torch.ones(length, length, device=q.device, dtype=torch.bool).triu(1), float('-inf'))
+    return (logits.softmax(-1) @ vh).transpose(0, 1).reshape(length, kv_heads, q_heads // kv_heads, dim)
+
+
+def hif4_calibration_attention(calib_qkv_list, q_num_heads, kv_num_heads, head_dim):
+    states = _K_BASE_CALIBRATION(calib_qkv_list, q_num_heads, kv_num_heads, head_dim)
+    if _K_CENTER_MODE == 'off':
+        states['k_state']['center_enabled'] = torch.zeros(kv_num_heads, dtype=torch.bool)
+        return states
+    if _K_CENTER_MODE == 'always':
+        states['k_state']['center_enabled'] = torch.ones(kv_num_heads, dtype=torch.bool)
+        return states
+    count = min(len(calib_qkv_list), _K_CENTER_CALIB_SAMPLES)
+    sample_indices = torch.linspace(0, len(calib_qkv_list) - 1, count).round().long().tolist()
+    ratios = []
+    all_heads = torch.ones(kv_num_heads, dtype=torch.bool)
+    no_heads = torch.zeros(kv_num_heads, dtype=torch.bool)
+    for index in sample_indices:
+        sample = calib_qkv_list[index]
+        length = sample['q'][0].shape[0]
+        positions = torch.linspace(0, length - 1, min(length, _K_CENTER_CALIB_TOKENS)).round().long()
+        pairs = {name: tuple(t[positions] for t in sample[name]) for name in ('q', 'k', 'v')}
+        raw = {name: _dequantize_nvfp4_fp32(*pairs[name]) for name in pairs}
+        qh = _k_reconstruct(hif4_dynamic_quantize_q(*pairs['q'], q_num_heads, head_dim, states['q_state']), raw['q'].shape)
+        vh = _k_reconstruct(hif4_dynamic_quantize_v(*pairs['v'], kv_num_heads, head_dim, states['v_state']), raw['v'].shape)
+        keys = [_k_reconstruct(_k_quantize_value(raw['k'], kv_num_heads, head_dim, states['k_state'], mask), raw['k'].shape)
+                for mask in (no_heads, all_heads)]
+        profiles = []
+        for causal in (False, True):
+            gold = _k_calibration_attention(raw['q'], raw['k'], raw['v'], q_num_heads, kv_num_heads, head_dim, causal)
+            errors = [(_k_calibration_attention(qh, key, vh, q_num_heads, kv_num_heads, head_dim, causal) - gold).square().mean(dim=(0, 2, 3)) for key in keys]
+            profiles.append(torch.nan_to_num(
+                errors[1] / errors[0].clamp_min(1e-30),
+                nan=1., posinf=1e30, neginf=1e30))
+        ratios.append(torch.stack(profiles))
+    ratio = torch.stack(ratios)  # [sample, full/causal, KV-head]
+    enabled = (ratio.mean(0) < 1 - _K_CENTER_IMPROVEMENT).all(0)
+    enabled &= (ratio <= 1 + _K_CENTER_MAX_SAMPLE_REGRESSION).all(dim=(0, 1))
+    for split in (ratio[::2], ratio[1::2]):
+        if split.shape[0]:
+            enabled &= (split.mean(0) < 1 - _K_CENTER_IMPROVEMENT).all(0)
+    states['k_state']['center_enabled'] = enabled.cpu().contiguous()
+    states['k_state']['center_calibration_error_ratio'] = ratio.mean(0).cpu().contiguous()
+    return states
+
+
+def hif4_dynamic_quantize_k(k_quant, k_scale, kv_num_heads, head_dim, k_state):
+    enabled = k_state.get('center_enabled')
+    if _K_MANTISSA_STRENGTH == 0 and (enabled is None or not bool(enabled.any())):
+        return _K_BASE_DYNAMIC(k_quant, k_scale, kv_num_heads, head_dim, k_state)
+    _validate_attention_shape(k_quant, kv_num_heads, head_dim, 'k')
+    k = _dequantize_nvfp4_fp32(k_quant, k_scale)
+    return _k_quantize_value(k, kv_num_heads, head_dim, k_state, enabled)
+
+_K_CENTER_MODE = 'guarded'
+_K_MANTISSA_STRENGTH = 0.25
