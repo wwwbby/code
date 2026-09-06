@@ -1736,10 +1736,17 @@ def hif4_calibration_and_quantize_weight(
     activation_second = activation_second.clamp_min(1.0e-8)
 
     baseline_weight_params = _quantize_hif4(transformed_weight, activation_second)
+    weight_hessian = _build_block_hessian_reg(transformed_activations, channels)
+    weight_factors = _factor_low_rank_hessian(weight_hessian)
     weight_params = _quantize_hif4_low_rank_hessian(
         transformed_weight,
-        _build_block_hessian_reg(transformed_activations, channels),
+        None,
         baseline_weight_params,
+        precomputed_factors=weight_factors,
+    )
+    weight_params = _w_adaptive_mantissa(
+        transformed_weight, weight_hessian, weight_params,
+        transformed_activations, weight_factors,
     )
 
     activation_importance = transformed_weight.square().sum(dim=0).clamp_min(1.0e-8)
@@ -2281,3 +2288,91 @@ def hif4_dynamic_quantize_v(v_quant, v_scale, kv_num_heads, head_dim, v_state):
     beta = beta[:, None].expand(kv_num_heads, head_dim).reshape(1, 1, -1)
     v = _dequantize_nvfp4_fp32(v_quant, v_scale)
     return _v_exchange_round(v, params, beta)
+
+
+def _w_covariance_reliability(transformed_activations,hessian_reg):
+    """Estimate how much off-diagonal energy exceeds sampling noise.
+
+    Each token supplies products x_i*x_j. Their sample variance estimates the
+    uncertainty of the second moment, without computing a Linear output target.
+    """
+    blocks=len(hessian_reg)
+    rows=torch.cat([x.reshape(-1,blocks,64) for x in transformed_activations],0)
+    count=len(rows)
+    if count<2:return torch.zeros(blocks,dtype=torch.float32)
+    squared=rows.square()
+    normalization=squared.mean((0,2)).clamp_min(1e-8)
+    sum_fourth=(squared.sum(-1).square()-squared.square().sum(-1)).mean(0)/normalization.square()
+    h=hessian_reg-_HESSIAN_DAMPING*torch.eye(64)[None]
+    off_energy=(h.square().sum((-1,-2))-h.diagonal(dim1=-2,dim2=-1).square().sum(-1)).clamp_min(0)
+    uncertainty=(sum_fourth-off_energy).clamp_min(0)/(count-1)
+    return (1-uncertainty/off_energy.clamp_min(1e-12)).clamp(0,1)
+
+
+def _w_adaptive_mantissa(values,hessian_reg,params,transformed_activations,factors=None):
+    reliability=_w_covariance_reliability(transformed_activations,hessian_reg)
+    active=reliability>0
+    if not bool(active.any()):return params
+    if factors is None:factors=_factor_low_rank_hessian(hessian_reg)
+    diagonal,low_rank=factors
+    if not bool(active.all()):
+        rows,channels=values.shape
+        selected=values.reshape(rows,-1,64)[:,active].reshape(rows,-1)
+        selected_params={key:value[:,active].contiguous() for key,value in params.items()}
+        refined=_w_tail_round(selected,selected_params,diagonal[active],low_rank[active],(.25*reliability[active])[:,None,None])
+        result=dict(params)
+        for key in ('sign','mant'):
+            result[key]=params[key].clone()
+            result[key][:,active]=refined[key]
+        return result
+    return _w_tail_round(values,params,diagonal,low_rank,(.25*reliability)[:,None,None])
+
+
+def _w_tail_round(values,params,diagonal,factors,strength):
+    """Same coordinate updates as K rounding, skipping stationary W blocks.
+
+    The conservative gradient bound includes a margin for reduction roundoff.
+    Skipped blocks cannot start a legal one-coordinate descent update.
+    """
+    rows,channels=values.shape;blocks=channels//64
+    exact_diagonal=diagonal+factors.square().sum(-1)
+    factors=factors*strength.sqrt();diagonal=exact_diagonal-factors.square().sum(-1)
+    recon=_k_reconstruct(params,values.shape).reshape(-1,64)
+    source=values.reshape(-1,64)
+    step=((params['scale_factor']*params['scale_lv2']*params['scale_lv3'])/4).expand_as(params['mant']).reshape(-1,64)
+    optimized=recon.clone()
+    for start in range(0,len(recon),_HESSIAN_CHUNK_BLOCKS):
+        end=min(start+_HESSIAN_CHUNK_BLOCKS,len(recon))
+        index=torch.arange(start,end)%blocks
+        d,u=diagonal[index],factors[index]
+        error=source[start:end]-recon[start:end]
+        projected=torch.bmm(error[:,None,:],u).squeeze(1)
+        gradient=d*error+torch.bmm(u,projected[:,:,None]).squeeze(-1)
+        hii=d+u.square().sum(-1)
+        quantum=step[start:end];codes=(recon[start:end]/quantum).round()
+        bound=.5*quantum*hii*(1-1e-5)
+        active=(((gradient>=bound)&(codes<7))|((-gradient>=bound)&(codes>-7))).any(-1)
+        if not bool(active.any()):continue
+        positions=torch.arange(start,end)[active]
+        d,u=d[active],u[active]
+        y=recon[positions].clone();error=error[active];projected=projected[active]
+        old_loss=(d*error.square()).sum(-1)+projected.square().sum(-1)
+        quantum=step[positions]
+        for lane in range(64):
+            ui=u[:,lane,:]
+            hii=d[:,lane]+ui.square().sum(-1)
+            he=d[:,lane]*error[:,lane]+(projected*ui).sum(-1)
+            q=quantum[:,lane]
+            target=y[:,lane]+he/hii.clamp_min(1e-12)
+            candidate=(target/q).round().clamp(-7,7)*q
+            delta=candidate-y[:,lane]
+            improvement=delta.square()*hii-2*delta*he
+            delta=torch.where(improvement<0,delta,0.)
+            y[:,lane]+=delta;error[:,lane]-=delta;projected-=delta[:,None]*ui
+        error=source[positions]-y
+        projected=torch.bmm(error[:,None,:],u).squeeze(1)
+        loss=(d*error.square()).sum(-1)+projected.square().sum(-1)
+        optimized[positions]=torch.where((loss<old_loss*.99)[:,None],y,recon[positions])
+    code=(optimized/step).round().clamp(-7,7).reshape_as(params['mant'])
+    output=dict(params);output['sign']=code.sign().contiguous();output['mant']=(code.abs()/4).contiguous()
+    return output

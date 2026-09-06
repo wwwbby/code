@@ -39,6 +39,36 @@ Git and must not silently return in a later candidate.
 
 ## Conclusions supported by the current server
 
+### Linear output-error rounding candidate (server result pending)
+
+The next isolated candidate starts from `988385e` (17440 / 252 s) and changes
+only Linear weight mantissas. It preserves the existing scales and estimates
+off-diagonal covariance reliability from calibration second/fourth moments.
+Sampling uncertainty suppresses the additional correlation term; the retained
+strength is at most 0.25. One coordinate pass must improve the approximate
+block objective by at least 1%. No Linear A@W calibration target is computed.
+
+- Public Linear mean output NMSE: -7.7452%; eight real-model layers: -4.2177%.
+- Nine-family synthetic development/holdout: -3.1458% / -2.7979%.
+- No regression among the 27 configurations or 91 individual tests tested.
+  These changes cannot be converted directly to server points.
+- The earlier fixed-strength candidate slightly regressed some synthetic
+  families. Estimating sampling uncertainty preserves the independent-noise
+  cases and retains gains on correlated cases.
+- The final kernel skips stationary blocks using a conservative gradient
+  bound. It exactly matches the unpruned prototype on public, real-model and
+  synthetic holdout data. All previous functions except Linear calibration
+  are unchanged, including Q/K/V and dynamic activation.
+- Official format check 22/22. Same-process four-thread times: control 23.5368
+  s, candidate 24.9988 s, control 23.1877 s. Relative to the control mean the
+  increase is 7.00%; multiplying 252 s gives a rough 269.7 s estimate, not a
+  guaranteed server runtime. The hard limit remains 300 s.
+
+Two V extensions were not promoted: a hierarchy/global-scale coordinate pass
+improved public output NMSE by only about 0.03% while markedly increasing V
+runtime; adding cross-segment error coupling yielded only about 0.1% there.
+Their implementations remain local research artifacts, outside the submission.
+
 ### 2026-09-06: V output-error research (server gain confirmed)
 
 The next candidate changes only V mantissa rounding on top of `3c40705`.
