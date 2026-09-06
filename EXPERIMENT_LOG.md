@@ -17,7 +17,14 @@ dataset and must not be used to predict the current leaderboard.
 | `097c2e5` | 16775 | 244 s | rejected | Rank-40/two sweeps plus position-aware output Hessian |
 | `e0a19b0` | 16700 | 250 s | rejected | Cross-validated K and per-KV-head alpha selection |
 | `3c40705` | 16991 | 250 s | previous baseline | Guarded K centering plus fixed-scale K mantissa refinement |
-| `988385e` | **17440** | **252 s** | **online baseline** | V output-error coupling across 16-token groups |
+| `988385e` | 17440 | 252 s | previous baseline | V output-error coupling across 16-token groups |
+| `be6ffae` | **17508** | **254 s** | **online baseline** | Linear mantissa refinement with covariance reliability |
+
+The user reported `be6ffae` at 17508 points and 254 seconds. The isolated
+Linear mechanism gains 68 points for 2 seconds. Its small score contribution,
+despite measurable local Linear gains, makes further Linear complexity a low
+priority. Current scoring weights remain unknown; do not infer exact weights
+from this single ablation. The remaining gap to 20000 is 2492 points.
 
 The user reported `988385e` at 17440 points and 252 seconds. Relative to its
 parent, the isolated V mechanism gains 449 points for 2 seconds. It is promoted
@@ -39,7 +46,7 @@ Git and must not silently return in a later candidate.
 
 ## Conclusions supported by the current server
 
-### Linear output-error rounding candidate (server result pending)
+### Linear output-error rounding (server gain confirmed)
 
 The next isolated candidate starts from `988385e` (17440 / 252 s) and changes
 only Linear weight mantissas. It preserves the existing scales and estimates
@@ -63,6 +70,8 @@ block objective by at least 1%. No Linear A@W calibration target is computed.
   s, candidate 24.9988 s, control 23.1877 s. Relative to the control mean the
   increase is 7.00%; multiplying 252 s gives a rough 269.7 s estimate, not a
   guaranteed server runtime. The hard limit remains 300 s.
+- Actual server result: 17508 / 254 s. The local 269.7 s extrapolation was
+  conservative; runtime scaling is workload-dependent and is not a guarantee.
 
 Two V extensions were not promoted: a hierarchy/global-scale coordinate pass
 improved public output NMSE by only about 0.03% while markedly increasing V
