@@ -13,15 +13,52 @@ dataset and must not be used to predict the current leaderboard.
 | `a649209` | 16000 | 243 s | superseded | Rank-8 low-rank Linear Hessian |
 | `237b142` | 0 | >300 s | rejected | Dynamic Q+K Attention Hessian; timed out |
 | `b7248c6` | 16000 | not recorded | rejected | Timeout-safe adaptive Q/K and guarded V path |
-| `def4524` | **16775** | **242 s** | **online baseline** | Rank-32 Linear plus pre-factored K-only Hessian |
+| `def4524` | 16775 | 242 s | previous baseline | Rank-32 Linear plus pre-factored K-only Hessian |
 | `097c2e5` | 16775 | 244 s | rejected | Rank-40/two sweeps plus position-aware output Hessian |
 | `e0a19b0` | 16700 | 250 s | rejected | Cross-validated K and per-KV-head alpha selection |
+| `3c40705` | **16991** | **250 s** | **online baseline** | Guarded K centering plus fixed-scale K mantissa refinement |
+
+The user reported the `3c40705` result on 2026-09-06. It gains 216 points
+and takes 8 seconds more than `def4524`; 3009 points remain to the target.
+Centering and mantissa refinement were submitted together, so their separate
+server contributions are unknown. Local proxy gains are not server points.
+
+The user clarified that 20000 is the minimum competitive algorithm target,
+motivated by another entrant reportedly scoring 22000. There is no known
+20000-point source revision or official standard-converter score. Research must
+seek a stronger algorithmic approach, not assume small gains near 17000 suffice.
 
 `13a718a` is the explicit source rollback from rejected `097c2e5` to the
 `def4524` numerical path. The rejected implementation remains recoverable from
 Git and must not silently return in a later candidate.
 
 ## Conclusions supported by the current server
+
+### 2026-09-06: V output-error research (server result pending)
+
+The next candidate changes only V mantissa rounding on top of `3c40705`.
+It minimizes a coupled 16-token loss, sum(e^2) + beta * sum(e)^2, with one
+calibration-derived coefficient per KV head. The coefficient retains average
+probability coupling rather than learned position-specific entries. Four
+greedy legal-mantissa updates each strictly lower this approximate objective;
+the existing global/lv2/lv3 scales are unchanged.
+
+- Public Attention output NMSE: full -3.8153%, causal -3.4215%.
+- Four-model/eight-layer mean relative NMSE: -10.3057% (full/causal separately).
+- Generic RoPE stress: -8.4373%; 12 synthetic holdout configurations: -3.2461%;
+  three long-sequence configurations: -3.6892%.
+- All 64 configuration/mask averages improve; the worst individual sample
+  regresses 0.0488%. These are local errors, not estimated server points.
+- A learned 16x16 positional metric was rejected: one model-layer full error
+  increased about 140%. Sequence-wide dual rounding was also not selected.
+- Independent FP32 Golden, pinned parent `3c40705`, 18 objective/grid/shape
+  checks, kernel parity over 20 configurations, and complete public API
+  integration checks passed. Q/K states and outputs remain unchanged.
+- Official format check: 22/22. Same-process times, four CPU threads: parent
+  22.52 s, candidate 22.57 s, parent 22.99 s. Server score/time remain unknown.
+
+This is an isolated direction-validation candidate. It must not be described
+as a 20000-point solution before server evaluation.
 
 1. The hard timeout is 300 seconds. A local gain is irrelevant if the server
    run crosses that boundary.

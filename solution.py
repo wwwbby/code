@@ -2190,3 +2190,94 @@ def hif4_dynamic_quantize_k(k_quant, k_scale, kv_num_heads, head_dim, k_state):
 
 _K_CENTER_MODE = 'guarded'
 _K_MANTISSA_STRENGTH = 0.25
+
+
+# V quantization with a calibration-derived, permutation-invariant token metric.
+# For each channel and 16-token segment, minimize
+# sum(error ** 2) + beta * sum(error) ** 2 using only legal mantissa changes.
+_V_TOKEN_GROUP = 16
+_V_TOKEN_COUPLING = 0.25
+_V_TOKEN_UPDATES = 4
+_V_EXCHANGE_CALIBRATION = hif4_calibration_attention
+_V_EXCHANGE_DYNAMIC = hif4_dynamic_quantize_v
+
+
+def _v_exchange_coefficient(calib, qh, kh, dim):
+    group = _V_TOKEN_GROUP
+    coefficient = torch.zeros(kh, dtype=torch.float32)
+    if not calib:
+        return coefficient
+    for sample in calib:
+        q = _dequantize_nvfp4_fp32(*sample['q'])
+        k = _dequantize_nvfp4_fp32(*sample['k'])
+        length = int(q.shape[0])
+        q = q.reshape(length, kh, qh // kh, dim).permute(1, 2, 0, 3)
+        k = k.reshape(length, kh, dim).permute(1, 0, 2)
+        pos = torch.linspace(0, length - 1, min(length, 32)).round().long()
+        logits = torch.einsum('hgtd,hkd->hgtk', q[:, :, pos], k) / (dim ** 0.5)
+        for causal in (False, True):
+            z = logits
+            if causal:
+                z = z.masked_fill(
+                    torch.arange(length)[None, None, None, :] > pos[None, None, :, None],
+                    -float('inf'),
+                )
+            p = z.softmax(-1)
+            p = torch.nn.functional.pad(p, (0, (-length) % group)).reshape(kh, -1, group)
+            diagonal = p.square().sum((1, 2))
+            total = p.sum(-1).square().sum(-1)
+            ratio = (total - diagonal) / ((group - 1) * diagonal.clamp_min(1e-12))
+            coefficient += ratio / (2 * len(calib))
+    return (_V_TOKEN_COUPLING * coefficient).clamp(0., _V_TOKEN_COUPLING).contiguous()
+
+
+def _v_exchange_round(v, params, beta):
+    group = _V_TOKEN_GROUP
+    length, width = v.shape
+    padding = (-length) % group
+    step = ((params['scale_factor'].float() * params['scale_lv2'].float()
+             * params['scale_lv3'].float()) / 4).expand_as(params['mant']).reshape(v.shape)
+    y = _k_reconstruct(params, v.shape)
+    source = torch.nn.functional.pad(v, (0, 0, 0, padding)).reshape(-1, group, width)
+    steps = torch.nn.functional.pad(step, (0, 0, 0, padding), value=1.).reshape(-1, group, width)
+    quant = torch.nn.functional.pad(y, (0, 0, 0, padding)).reshape(-1, group, width)
+    codes = (quant / steps).round().clamp(-7, 7)
+    error = quant - source
+    valid = (torch.arange(length + padding) < length).reshape(-1, group, 1)
+    for _ in range(_V_TOKEN_UPDATES):
+        total = error.sum(1, keepdim=True)
+        direction = -total.sign()
+        delta = steps * direction
+        cost = 2 * error * delta + delta.square() + beta * (2 * total * delta + delta.square())
+        allowed = valid & (codes + direction >= -7) & (codes + direction <= 7)
+        cost = cost.masked_fill(~allowed, float('inf'))
+        best, index = cost.min(1, keepdim=True)
+        improve = best < 0
+        error.scatter_add_(1, index, delta.gather(1, index) * improve)
+        codes.scatter_add_(1, index, direction.expand_as(codes).gather(1, index) * improve)
+    codes = codes.reshape(-1, width)[:length].reshape_as(params['mant'])
+    result = dict(params)
+    result['sign'] = codes.sign()
+    result['mant'] = codes.abs() / 4
+    return result
+
+
+def hif4_calibration_attention(calib_qkv_list, q_num_heads, kv_num_heads, head_dim):
+    state = _V_EXCHANGE_CALIBRATION(calib_qkv_list, q_num_heads, kv_num_heads, head_dim)
+    state['v_state']['token_coupling'] = _v_exchange_coefficient(
+        calib_qkv_list, q_num_heads, kv_num_heads, head_dim,
+    )
+    state['v_state']['algorithm'] = 'hif4-v-exchangeable-output-error'
+    return state
+
+
+def hif4_dynamic_quantize_v(v_quant, v_scale, kv_num_heads, head_dim, v_state):
+    params = _V_EXCHANGE_DYNAMIC(v_quant, v_scale, kv_num_heads, head_dim, v_state)
+    # The pinned K calibration evaluates V before this wrapper has attached
+    # the new V-only state. Preserve that K selection exactly.
+    if 'token_coupling' not in v_state:
+        return params
+    beta = _state_tensor(v_state, 'token_coupling', (kv_num_heads,))
+    beta = beta[:, None].expand(kv_num_heads, head_dim).reshape(1, 1, -1)
+    v = _dequantize_nvfp4_fp32(v_quant, v_scale)
+    return _v_exchange_round(v, params, beta)
