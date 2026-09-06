@@ -16,7 +16,12 @@ dataset and must not be used to predict the current leaderboard.
 | `def4524` | 16775 | 242 s | previous baseline | Rank-32 Linear plus pre-factored K-only Hessian |
 | `097c2e5` | 16775 | 244 s | rejected | Rank-40/two sweeps plus position-aware output Hessian |
 | `e0a19b0` | 16700 | 250 s | rejected | Cross-validated K and per-KV-head alpha selection |
-| `3c40705` | **16991** | **250 s** | **online baseline** | Guarded K centering plus fixed-scale K mantissa refinement |
+| `3c40705` | 16991 | 250 s | previous baseline | Guarded K centering plus fixed-scale K mantissa refinement |
+| `988385e` | **17440** | **252 s** | **online baseline** | V output-error coupling across 16-token groups |
+
+The user reported `988385e` at 17440 points and 252 seconds. Relative to its
+parent, the isolated V mechanism gains 449 points for 2 seconds. It is promoted
+as the best verified source; 2560 points remain to the 20000 minimum target.
 
 The user reported the `3c40705` result on 2026-09-06. It gains 216 points
 and takes 8 seconds more than `def4524`; 3009 points remain to the target.
@@ -34,7 +39,7 @@ Git and must not silently return in a later candidate.
 
 ## Conclusions supported by the current server
 
-### 2026-09-06: V output-error research (server result pending)
+### 2026-09-06: V output-error research (server gain confirmed)
 
 The next candidate changes only V mantissa rounding on top of `3c40705`.
 It minimizes a coupled 16-token loss, sum(e^2) + beta * sum(e)^2, with one
@@ -55,7 +60,7 @@ the existing global/lv2/lv3 scales are unchanged.
   checks, kernel parity over 20 configurations, and complete public API
   integration checks passed. Q/K states and outputs remain unchanged.
 - Official format check: 22/22. Same-process times, four CPU threads: parent
-  22.52 s, candidate 22.57 s, parent 22.99 s. Server score/time remain unknown.
+  22.52 s, candidate 22.57 s, parent 22.99 s. Server result: 17440 / 252 s.
 
 This is an isolated direction-validation candidate. It must not be described
 as a 20000-point solution before server evaluation.
