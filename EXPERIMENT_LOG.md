@@ -19,6 +19,7 @@ dataset and must not be used to predict the current leaderboard.
 | `3c40705` | 16991 | 250 s | previous baseline | Guarded K centering plus fixed-scale K mantissa refinement |
 | `988385e` | 17440 | 252 s | previous baseline | V output-error coupling across 16-token groups |
 | `be6ffae` | **17508** | **254 s** | **online baseline** | Linear mantissa refinement with covariance reliability |
+| `experiment/qk-low-rank-balance` | pending | pending | candidate | Held-out calibration selects a rank-two equivalent Q/K transform |
 
 The user reported `be6ffae` at 17508 points and 254 seconds. The isolated
 Linear mechanism gains 68 points for 2 seconds. Its small score contribution,
@@ -45,6 +46,60 @@ seek a stronger algorithmic approach, not assume small gains near 17000 suffice.
 Git and must not silently return in a later candidate.
 
 ## Conclusions supported by the current server
+
+### Q/K low-rank equivalent balancing (candidate; no server result)
+
+This candidate starts from the 17508 / 254 s implementation. Channelwise
+smoothing cannot balance arbitrary correlated directions. Per KV head, fit
+two dominant directions U from the normalized Q/K second moments and use
+S = I + U diag(g - 1) U.T, with Q -> Q S and K -> K S inverse. Each group of
+Q heads shares its KV head's transform. Gains equal the fourth root of the
+normalized K/Q variances and are bounded to [0.5, 2]. A sample-size-aware
+eigenvalue threshold suppresses weak directions. Unquantized QK.T is preserved.
+
+Fit the new basis, gains and corresponding rank-8 K metric on even-indexed
+calibration samples; validate on up to three odd-indexed samples. With three
+samples, fit sample 0 and validate samples 1/2. With fewer than three, preserve
+the parent. Existing parent smoothing/centering still uses all calibration
+samples; only the new mechanism has this fit/validation split. Validation
+uses at most 64 Query rows but all Keys/Values with their actual causal
+positions. A KV head requires >=5% mean improvement for both full/causal,
+no validation sample >2% worse, and >=2% improvement in each validation half.
+The retained basis and reciprocal gains are frozen CPU tensors.
+
+- Against the 17508 parent, mean Attention NMSE changes: real-model -13.1007%,
+  generic RoPE stress -6.3807%, correlated-direction/distribution-shift stress
+  -9.5219%. Public, synthetic holdout and extended 1024/4096-token profiles
+  disable the new transform and exactly preserve the parent outputs.
+- 40 configurations and 112 test inputs, each checked with full/causal masks
+  (224 test/mask pairs). Means first average test NMSE within each
+  configuration/mask, then average relative changes equally across groups.
+  These numbers are not organizer points or a 20000-point prediction.
+- The worst configuration/mask mean is OPT layer 4 full Attention at +1.1239%.
+  Its worst individual test is +3.0775%. Generic RoPE has a +5.2945% individual
+  regression despite no regressing configuration/mask mean. Calibration
+  filtering is not a guarantee for each hidden input. Real captures are short
+  sequences from four models/eight layers; generic RoPE is explicitly a stress
+  transform, not an exact claim about those models' deployed configurations.
+- Public/real/RoPE/correlated-stress final API outputs exactly match the
+  research prototype on 85 test inputs. V and all-disabled states/outputs
+  match the parent exactly. Dynamic calls do not mutate calibration state.
+- Active-path diagnostic shapes cover MHA/GQA/MQA and head_dim 64/128/192/256.
+  Forced activation occurs only in diagnostics, not in submitted calibration.
+  Independent sampled-row Golden and paired-transform invariance checks pass.
+- Public format check: 22/22. Same-process four-thread control/candidate/control
+  times are 34.1146 / 33.7427 / 32.2434 seconds. Candidate is +0.5636 seconds
+  against the control mean (+1.6987%); that difference is smaller than the
+  control variation. Do not extrapolate this to a promised server runtime.
+- The submitted file retains the entire parent source as an exact byte prefix
+  and overrides only Attention calibration, Q quantization and the internal K
+  quantization helper. Linear, Activation and V implementations are unchanged.
+  It adds no imports, file access, external data, benchmark identities or
+  mutable cross-call cache. The submission archive contains only solution.py.
+
+Source SHA-256:
+`a2e60ff46e51467c9457a4396f6ad70a450277d74dc1d8b669790854f298c8f5`.
+Keep main at the verified 17508 implementation until a server result is known.
 
 ### Linear output-error rounding (server gain confirmed)
 

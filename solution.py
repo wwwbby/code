@@ -2376,3 +2376,206 @@ def _w_tail_round(values,params,diagonal,factors,strength):
     code=(optimized/step).round().clamp(-7,7).reshape_as(params['mant'])
     output=dict(params);output['sign']=code.sign().contiguous();output['mant']=(code.abs()/4).contiguous()
     return output
+
+
+# Equivalent rank-two Q/K balancing, selected on held-out calibration samples.
+# S = I + U diag(g - 1) U.T; K uses S inverse, preserving QK.T.
+def _qk_balance_transform(x, heads, kh, d, basis, gain):
+    xx = x.reshape(-1, kh, heads // kh, d)
+    projected = torch.einsum('thgd,hdr->thgr', xx, basis)
+    delta = torch.einsum('thgr,hdr->thgd', projected * (gain - 1)[None, :, None, :], basis)
+    return (xx + delta).reshape_as(x)
+
+def _qk_balance_setup(a, state, rank=2):
+    qh, kh, d = [a[k] for k in ('q_num_heads', 'kv_num_heads', 'head_dim')]
+    qs, ks = ([], [])
+    for sample in a['calib']:
+        q = _dequantize_nvfp4_fp32(*sample['q'])
+        k = _dequantize_nvfp4_fp32(*sample['k'])
+        k = (k.reshape(-1, kh, d) - k.reshape(-1, kh, d).mean(0, keepdim=True)).reshape_as(k)
+        q = _apply_attention_hadamard((q.reshape(-1, qh, d) / state['q_state']['smooth_scale']).reshape_as(q), qh, d)
+        k = _apply_attention_hadamard((k.reshape(-1, kh, d) * state['k_state']['smooth_scale']).reshape_as(k), kh, d)
+        pos = torch.linspace(0, len(q) - 1, min(len(q), 64)).round().long()
+        qs.append(q[pos])
+        ks.append(k[pos])
+    q = torch.cat(qs)
+    k = torch.cat(ks)
+    n = len(q)
+    qq = q.reshape(n, kh, qh // kh, d)
+    kk = k.reshape(n, kh, d)
+    cq = torch.einsum('thgi,thgj->hij', qq, qq) / (n * (qh // kh))
+    ck = torch.einsum('thi,thj->hij', kk, kk) / n
+    dq = cq.diagonal(dim1=-2, dim2=-1).mean(-1).clamp_min(1e-12)
+    dk = ck.diagonal(dim1=-2, dim2=-1).mean(-1).clamp_min(1e-12)
+    normq = cq / dq[:, None, None]
+    normk = ck / dk[:, None, None]
+    covariance = (normq + normk) / 2
+    vals, vecs = torch.linalg.eigh(covariance)
+    basis = vecs[:, :, -rank:]
+    eigen = vals[:, -rank:]
+    qvar = torch.einsum('hir,hij,hjr->hr', basis, normq, basis).clamp_min(1e-06)
+    kvar = torch.einsum('hir,hij,hjr->hr', basis, normk, basis).clamp_min(1e-06)
+    gain = (kvar / qvar).pow(0.25).clamp(0.5, 2.0)
+    threshold = 1.2 * (1 + (d / max(n, 1)) ** 0.5) ** 2
+    enabled = eigen > threshold
+    gain = torch.where(enabled, gain, torch.ones_like(gain))
+    active = (gain != 1).any(-1)
+    if not bool(active.any()):
+        return None
+    qt = _qk_balance_transform(q, qh, kh, d, basis, gain)
+    head_blocks = d // 64
+    qcov = torch.zeros(qh, head_blocks, 64, 64)
+    offset = 0
+    for item in qs:
+        t = qt[offset:offset + len(item)].reshape(-1, qh, head_blocks, 64)
+        offset += len(item)
+        qcov += torch.einsum('thbi,thbj->hbij', t, t)
+    h = qcov.reshape(kh, qh // kh, head_blocks, 64, 64).mean(1) / n
+    h = h.reshape(-1, 64, 64)
+    scale = h.diagonal(dim1=-2, dim2=-1).mean(-1).clamp_min(1e-08)
+    h = h / scale[:, None, None] + _HESSIAN_DAMPING * torch.eye(64)[None]
+    diagonal, factors = _factor_low_rank_hessian(h, _ATTENTION_K_HESSIAN_RANK)
+    mask = active.repeat_interleave(head_blocks)
+    diagonal = torch.where(mask[:, None], diagonal, state['k_state']['hessian_diagonal'])
+    factors = torch.where(mask[:, None, None], factors, state['k_state']['hessian_factors'])
+    return {'basis': basis, 'gain': gain, 'active': active, 'eigenvalues': eigen, 'threshold': threshold, 'hessian_diagonal': diagonal, 'hessian_factors': factors}
+
+def _qk_balance_quantize(x, state, meta, qh, kh, d):
+    q = _apply_attention_hadamard((x['q'].reshape(-1, qh, d) / state['q_state']['smooth_scale']).reshape_as(x['q']), qh, d)
+    k = x['k'].reshape(-1, kh, d)
+    center = state['k_state']['center_enabled']
+    k = k - k.mean(0, keepdim=True) * center[None, :, None]
+    k = _apply_attention_hadamard((k * state['k_state']['smooth_scale']).reshape_as(x['k']), kh, d)
+    if meta is not None:
+        q = _qk_balance_transform(q, qh, kh, d, meta['basis'], meta['gain'])
+        k = _qk_balance_transform(k, kh, kh, d, meta['basis'], meta['gain'].reciprocal())
+        diag, factor = (meta['hessian_diagonal'], meta['hessian_factors'])
+    else:
+        diag, factor = (state['k_state']['hessian_diagonal'], state['k_state']['hessian_factors'])
+    qp = _quantize_hif4(q)
+    kp = _quantize_hif4(k)
+    kp = _quantize_hif4_low_rank_hessian(k, None, kp, precomputed_factors=(diag, factor), sweep_rounds=_ATTENTION_K_HESSIAN_SWEEPS, min_replace_improvement=_ATTENTION_K_HESSIAN_MIN_REPLACE_IMPROVEMENT)
+    kp = _k_mantissa_refine(k, kp, diag, factor, 0.25)
+    return (_k_reconstruct(qp, q.shape), _k_reconstruct(kp, k.shape), q, k)
+
+def _qk_balance_attention_rows(q, k, v, qh, kh, d, positions, causal):
+    qq = q.reshape(-1, kh, qh // kh, d)
+    kk = k.reshape(-1, kh, d)
+    vv = v.reshape(-1, kh, d)
+    logits = torch.einsum('thgd,shd->hgts', qq, kk) / d ** 0.5
+    if causal:
+        logits = logits.masked_fill(torch.arange(len(k))[None, None, None, :] > positions[None, None, :, None], -float('inf'))
+    return torch.einsum('hgts,shd->thgd', logits.softmax(-1), vv)
+
+def _qk_balance_calibration_split(count):
+    if count < 3:
+        return ([], [])
+    if count == 3:
+        return ([0], [1, 2])
+    return (list(range(0, count, 2)), list(range(1, count, 2)))
+
+def _qk_balance_guard(a, state, meta, validation_only=False):
+    if meta is None:
+        return None
+    qh, kh, d = [a[k] for k in ('q_num_heads', 'kv_num_heads', 'head_dim')]
+    pool = _qk_balance_calibration_split(len(a['calib']))[1] if validation_only else list(range(len(a['calib'])))
+    indices = [pool[j] for j in torch.linspace(0, len(pool) - 1, min(3, len(pool))).round().long().tolist()]
+    ratios = []
+    for i in indices:
+        sample = a['calib'][i]
+        x = {k: _dequantize_nvfp4_fp32(*sample[k]) for k in ('q', 'k', 'v')}
+        pos = torch.linspace(0, len(x['q']) - 1, min(64, len(x['q']))).round().long()
+        x['q'] = x['q'][pos]
+        v = _k_reconstruct(hif4_dynamic_quantize_v(*sample['v'], kh, d, state['v_state']), x['v'].shape)
+        bq, bk, _, _ = _qk_balance_quantize(x, state, None, qh, kh, d)
+        cq, ck, _, _ = _qk_balance_quantize(x, state, meta, qh, kh, d)
+        profile = []
+        for causal in (False, True):
+            gold = _qk_balance_attention_rows(**x, qh=qh, kh=kh, d=d, positions=pos, causal=causal)
+            before = _qk_balance_attention_rows(bq, bk, v, qh, kh, d, pos, causal)
+            after = _qk_balance_attention_rows(cq, ck, v, qh, kh, d, pos, causal)
+            b = (before - gold).square().mean((0, 2, 3))
+            c = (after - gold).square().mean((0, 2, 3))
+            profile.append((c / b.clamp_min(1e-30)).nan_to_num(nan=10000000000.0, posinf=10000000000.0, neginf=10000000000.0))
+        ratios.append(torch.stack(profile))
+    r = torch.stack(ratios)
+    enabled = (r.mean(0) < 0.95).all(0) & (r.amax((0, 1)) <= 1.02) & meta['active']
+    for parity in (0, 1):
+        if len(r[parity::2]):
+            enabled &= (r[parity::2].mean(0) < 0.98).all(0)
+    if not bool(enabled.any()):
+        return None
+    result = dict(meta)
+    result['active'] = enabled
+    result['gain'] = torch.where(enabled[:, None], meta['gain'], 1.0)
+    mask = enabled.repeat_interleave(d // 64)
+    result['hessian_diagonal'] = torch.where(mask[:, None], meta['hessian_diagonal'], state['k_state']['hessian_diagonal'])
+    result['hessian_factors'] = torch.where(mask[:, None, None], meta['hessian_factors'], state['k_state']['hessian_factors'])
+    return result
+
+_QK_BALANCE_BASE_CALIBRATION = hif4_calibration_attention
+_QK_BALANCE_BASE_Q = hif4_dynamic_quantize_q
+_QK_BALANCE_BASE_K_VALUE = _k_quantize_value
+
+
+def hif4_calibration_attention(calib_qkv_list, q_num_heads, kv_num_heads, head_dim):
+    state = _QK_BALANCE_BASE_CALIBRATION(
+        calib_qkv_list, q_num_heads, kv_num_heads, head_dim)
+    fit, validation = _qk_balance_calibration_split(len(calib_qkv_list))
+    if not fit or len(validation) < 2:
+        return state
+    config = dict(calib=calib_qkv_list, q_num_heads=q_num_heads,
+                  kv_num_heads=kv_num_heads, head_dim=head_dim)
+    fitted = dict(config, calib=[calib_qkv_list[i] for i in fit])
+    meta = _qk_balance_setup(fitted, state)
+    meta = _qk_balance_guard(config, state, meta, validation_only=True)
+    if meta is None:
+        return state
+    # Both dynamic calls receive their own frozen pure-data copy. No Q/K cache.
+    for role in ('q', 'k'):
+        target = state[role + '_state']
+        target['balance_basis'] = meta['basis'].detach().cpu().contiguous().clone()
+        gain = meta['gain'] if role == 'q' else meta['gain'].reciprocal()
+        target['balance_gain'] = gain.detach().cpu().contiguous().clone()
+    state['q_state']['balance_kv_heads'] = int(kv_num_heads)
+    for key in ('hessian_diagonal', 'hessian_factors'):
+        state['k_state'][key] = meta[key].detach().cpu().contiguous().clone()
+    return state
+
+
+def hif4_dynamic_quantize_q(q_quant, q_scale, q_num_heads, head_dim, q_state):
+    if 'balance_basis' not in q_state:
+        return _QK_BALANCE_BASE_Q(q_quant, q_scale, q_num_heads, head_dim, q_state)
+    _validate_attention_shape(q_quant, q_num_heads, head_dim, 'q')
+    kv_heads = q_state['balance_kv_heads']
+    smooth = _state_tensor(q_state, 'smooth_scale', (q_num_heads, head_dim))
+    basis = _state_tensor(q_state, 'balance_basis', (kv_heads, head_dim, 2))
+    gain = _state_tensor(q_state, 'balance_gain', (kv_heads, 2))
+    q = _dequantize_nvfp4_fp32(q_quant, q_scale)
+    q = _apply_attention_hadamard(
+        (q.reshape(-1, q_num_heads, head_dim) / smooth).reshape_as(q), q_num_heads, head_dim)
+    q = _qk_balance_transform(q, q_num_heads, kv_heads, head_dim, basis, gain)
+    return _quantize_hif4(q)
+
+
+def _k_quantize_value(k, heads, dim, state, center_mask):
+    if 'balance_basis' not in state:
+        return _QK_BALANCE_BASE_K_VALUE(k, heads, dim, state, center_mask)
+    if center_mask is not None and bool(center_mask.any()):
+        values = k.reshape(-1, heads, dim)
+        k = (values - values.mean(0, keepdim=True) * center_mask[None, :, None]).reshape_as(k)
+    smooth = _state_tensor(state, 'smooth_scale', (heads, dim))
+    basis = _state_tensor(state, 'balance_basis', (heads, dim, 2))
+    gain = _state_tensor(state, 'balance_gain', (heads, 2))
+    transformed = _apply_attention_hadamard(
+        (k.reshape(-1, heads, dim) * smooth).reshape_as(k), heads, dim)
+    transformed = _qk_balance_transform(transformed, heads, heads, dim, basis, gain)
+    blocks = heads * dim // 64
+    diagonal = _state_tensor(state, 'hessian_diagonal', (blocks, 64))
+    factors = _state_tensor(state, 'hessian_factors', (blocks, 64, _ATTENTION_K_HESSIAN_RANK))
+    baseline = _quantize_hif4(transformed)
+    params = _quantize_hif4_low_rank_hessian(
+        transformed, None, baseline, precomputed_factors=(diagonal, factors),
+        sweep_rounds=_ATTENTION_K_HESSIAN_SWEEPS,
+        min_replace_improvement=_ATTENTION_K_HESSIAN_MIN_REPLACE_IMPROVEMENT)
+    return _k_mantissa_refine(transformed, params, diagonal, factors, _K_MANTISSA_STRENGTH)
