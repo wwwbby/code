@@ -23,9 +23,9 @@ dataset and must not be used to predict the current leaderboard.
 | `04a23c1` | not measured | not measured | pending parent | Nested 8/16-token V coupling plus bit-identical speedups |
 | `a2b0de7` | not measured | not measured | pending parent | Test-time softmax-invariant K translation selection |
 | `92ed4fe` | not measured | not measured | pending parent | Add nested 4-token V error coupling |
-| `768a670` | **18178** | **233 s** | **online baseline** | Speedups, nested V and dynamic K translation selection |
+| `768a670` | 18178 | 233 s | previous baseline | Speedups, nested V and dynamic K translation selection |
 | `9fa93f2` | not measured | not measured | submitted code parent | Fixed-scale K refinement in softmax quotient space |
-| `8d88fbc` | testing | testing | current server test | Record the `9fa93f2` quotient-space candidate |
+| `8d88fbc` | **18182** | **230 s** | **online baseline** | Append fixed-scale K quotient-space refinement |
 
 The user reported `768a670` at 18178 points in 233 seconds.  Relative to the
 previous online baseline `fe4b879`, the bundled branch gains 503 points.  Its
@@ -33,9 +33,15 @@ previous online baseline `fe4b879`, the bundled branch gains 503 points.  Its
 seconds faster than `be6ffae`, the nearest parent with a reported time.  The
 bundle contains bit-identical kernel speedups, nested V coupling, dynamic K
 translation selection and the four-token V term, so their individual server
-contributions cannot be separated.  Revision `8d88fbc` is currently being
-tested and differs numerically only by the appended quotient-space K mantissa
-pass.  The remaining gap to 20000 is 1822 points.
+contributions cannot be separated.
+
+The user then reported `8d88fbc` at 18182 points in 230 seconds.  It differs
+numerically only by the appended quotient-space K mantissa pass, so that pass
+contributes just 4 server points; the 3-second reduction is runtime noise in
+the favorable direction.  The mechanism remains in the best revision, but
+further K Hessian/mantissa expansion is stopped because the much larger local
+proxy gain did not transfer.  The remaining gap to 20000 is 1818 points, with
+70 seconds of measured timeout headroom.
 
 The user reported `fe4b879` at 17675 points. It confirms a 167-point gain from
 removing the 0.25 damping while leaving the operation count unchanged. Server
@@ -183,11 +189,11 @@ replaced only after at least 1% improvement in the quotient-space objective.
 - The integrated implementation matches the independent stacked prototype on
   all 60 selected K parameter tensors and their end-to-end scores.
 
-The public full regression makes this less certain than the dynamic centering
-candidate.  It is kept as a separately identifiable server experiment, not as
-a claim of guaranteed score improvement.  The submitted revision is
-`8d88fbc`; its server evaluation is in progress against the clean
-`768a670 = 18178/233 s` parent.
+The public full regression made this less certain than the dynamic centering
+candidate.  The submitted `8d88fbc` result is `18182/230 s` against the clean
+`768a670 = 18178/233 s` parent: only +4 points.  Do not spend more runtime on
+this refinement family; the next algorithmic work must target a different
+Attention/V bottleneck.
 
 The user clarified that 20000 is the minimum competitive algorithm target,
 motivated by another entrant reportedly scoring 22000. There is no known
