@@ -2114,6 +2114,74 @@ def _k_mantissa_refine(values, params, diagonal, factors, strength):
     return output
 
 
+def _k_quotient_mantissa_refine(values, params, diagonal, factors, strength):
+    """Refine fixed-scale K codes modulo softmax-invariant token offsets."""
+    rows, channels = values.shape
+    if rows <= 1:
+        return params
+    blocks = channels // 64
+    exact_diagonal = diagonal + factors.square().sum(dim=-1)
+    factors = factors * (strength ** 0.5)
+    diagonal = exact_diagonal - factors.square().sum(dim=-1)
+    source = values.reshape(rows, blocks, 64)
+    reconstructed = _k_reconstruct(params, values.shape).reshape(
+        rows, blocks, 64
+    )
+    optimized = reconstructed.clone()
+    step = (
+        (params['scale_factor'] * params['scale_lv2'] * params['scale_lv3'])
+        / 4
+    ).expand_as(params['mant']).reshape(rows, blocks, 64)
+
+    error = source - optimized
+    residual = error - error.mean(dim=0, keepdim=True)
+    projected = torch.einsum('tbi,bir->tbr', residual, factors)
+    old_loss = (diagonal[None] * residual.square()).sum(dim=(0, 2))
+    old_loss += projected.square().sum(dim=(0, 2))
+    mean_correction = 1.0 - 1.0 / rows
+
+    for lane in range(64):
+        factor_lane = factors[:, lane]
+        curvature = diagonal[:, lane] + factor_lane.square().sum(dim=-1)
+        gradient = diagonal[:, lane][None] * residual[:, :, lane]
+        gradient += (projected * factor_lane[None]).sum(dim=-1)
+        effective_curvature = curvature * mean_correction
+        target = optimized[:, :, lane] + gradient / effective_curvature.clamp_min(
+            1.0e-12
+        )[None]
+        candidate = (
+            (target / step[:, :, lane]).round().clamp(-7, 7)
+            * step[:, :, lane]
+        )
+        delta = candidate - optimized[:, :, lane]
+        local_change = (
+            delta.square() * effective_curvature[None] - 2 * delta * gradient
+        )
+        delta = torch.where(local_change < 0, delta, 0.0)
+        centered_delta = delta - delta.mean(dim=0, keepdim=True)
+        exact_change = (
+            centered_delta.square() * curvature[None]
+            - 2 * centered_delta * gradient
+        ).sum(dim=0)
+        delta *= (exact_change < 0)[None]
+        centered_delta = delta - delta.mean(dim=0, keepdim=True)
+        optimized[:, :, lane] += delta
+        residual[:, :, lane] -= centered_delta
+        projected -= centered_delta[:, :, None] * factor_lane[None]
+
+    new_loss = (diagonal[None] * residual.square()).sum(dim=(0, 2))
+    new_loss += projected.square().sum(dim=(0, 2))
+    use_refined = new_loss < old_loss * 0.99
+    optimized = torch.where(
+        use_refined[None, :, None], optimized, reconstructed
+    )
+    code = (optimized / step).round().clamp(-7, 7).reshape_as(params['mant'])
+    output = dict(params)
+    output['sign'] = code.sign().contiguous()
+    output['mant'] = (code.abs() / 4).contiguous()
+    return output
+
+
 def _k_quantize_value(k, heads, dim, state, center_mask):
     if center_mask is not None and bool(center_mask.any()):
         values = k.reshape(-1, heads, dim)
@@ -2292,6 +2360,13 @@ def hif4_dynamic_quantize_k(k_quant, k_scale, kv_num_heads, head_dim, k_state):
     )
     if _K_MANTISSA_STRENGTH > 0:
         output = _k_mantissa_refine(
+            target,
+            output,
+            diagonal,
+            factors,
+            _K_MANTISSA_STRENGTH,
+        )
+        output = _k_quotient_mantissa_refine(
             target,
             output,
             diagonal,
