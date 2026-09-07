@@ -2315,10 +2315,10 @@ _V_EXCHANGE_DYNAMIC = hif4_dynamic_quantize_v
 
 def _v_exchange_coefficient(calib, qh, kh, dim):
     coefficients = {
-        group: torch.zeros(kh, dtype=torch.float32) for group in (8, 16)
+        group: torch.zeros(kh, dtype=torch.float32) for group in (4, 8, 16)
     }
     if not calib:
-        return coefficients[8], coefficients[16]
+        return coefficients[4], coefficients[8], coefficients[16]
     for sample in calib:
         q = _dequantize_nvfp4_fp32(*sample['q'])
         k = _dequantize_nvfp4_fp32(*sample['k'])
@@ -2335,7 +2335,7 @@ def _v_exchange_coefficient(calib, qh, kh, dim):
                     -float('inf'),
                 )
             p = z.softmax(-1)
-            for group in (8, 16):
+            for group in (4, 8, 16):
                 grouped = torch.nn.functional.pad(
                     p, (0, (-length) % group)
                 ).reshape(kh, -1, group)
@@ -2345,15 +2345,20 @@ def _v_exchange_coefficient(calib, qh, kh, dim):
                     (group - 1) * diagonal.clamp_min(1e-12)
                 )
                 coefficients[group] += ratio / (2 * len(calib))
+    r4 = (_V_TOKEN_COUPLING * coefficients[4]).clamp_min(0.0)
     r8 = (_V_TOKEN_COUPLING * coefficients[8]).clamp_min(0.0)
     r16 = (_V_TOKEN_COUPLING * coefficients[16]).clamp_min(0.0)
-    within_fraction = 7.0 / 15.0
-    beta8 = ((r8 - r16) / (1.0 - within_fraction)).clamp_min(0.0)
-    beta16 = (r16 - within_fraction * beta8).clamp_min(0.0)
-    return beta8.contiguous(), beta16.contiguous()
+    beta4 = ((7.0 / 4.0) * (r4 - r8)).clamp_min(0.0)
+    beta8 = (
+        (15.0 / 8.0) * (r8 - r16) - (3.0 / 7.0) * beta4
+    ).clamp_min(0.0)
+    beta16 = (
+        r16 - (1.0 / 5.0) * beta4 - (7.0 / 15.0) * beta8
+    ).clamp_min(0.0)
+    return beta4.contiguous(), beta8.contiguous(), beta16.contiguous()
 
 
-def _v_exchange_round(v, params, beta8, beta16):
+def _v_exchange_round(v, params, beta4, beta8, beta16):
     group = _V_TOKEN_GROUP
     length, width = v.shape
     padding = (-length) % group
@@ -2370,6 +2375,8 @@ def _v_exchange_round(v, params, beta8, beta16):
         total16 = error.sum(1, keepdim=True)
         total8 = error.reshape(-1, 2, 8, width).sum(2, keepdim=True)
         total8 = total8.expand(-1, -1, 8, -1).reshape(-1, group, width)
+        total4 = error.reshape(-1, 4, 4, width).sum(2, keepdim=True)
+        total4 = total4.expand(-1, -1, 4, -1).reshape(-1, group, width)
         direction = -total16.sign()
         delta = steps * direction
         delta_square = delta.square()
@@ -2377,6 +2384,7 @@ def _v_exchange_round(v, params, beta8, beta16):
             2 * error * delta + delta_square
             + beta16 * (2 * total16 * delta + delta_square)
             + beta8 * (2 * total8 * delta + delta_square)
+            + beta4 * (2 * total4 * delta + delta_square)
         )
         allowed = valid & (codes + direction >= -7) & (codes + direction <= 7)
         cost = cost.masked_fill(~allowed, float('inf'))
@@ -2393,27 +2401,33 @@ def _v_exchange_round(v, params, beta8, beta16):
 
 def hif4_calibration_attention(calib_qkv_list, q_num_heads, kv_num_heads, head_dim):
     state = _V_EXCHANGE_CALIBRATION(calib_qkv_list, q_num_heads, kv_num_heads, head_dim)
-    beta8, beta16 = _v_exchange_coefficient(
+    beta4, beta8, beta16 = _v_exchange_coefficient(
         calib_qkv_list, q_num_heads, kv_num_heads, head_dim,
     )
+    state['v_state']['token_coupling4'] = beta4
     state['v_state']['token_coupling8'] = beta8
     state['v_state']['token_coupling16'] = beta16
-    state['v_state']['algorithm'] = 'hif4-v-nested8-16-output-error'
+    state['v_state']['algorithm'] = 'hif4-v-nested4-8-16-output-error'
     return state
 
 
 def hif4_dynamic_quantize_v(v_quant, v_scale, kv_num_heads, head_dim, v_state):
     params = _V_EXCHANGE_DYNAMIC(v_quant, v_scale, kv_num_heads, head_dim, v_state)
-    # The pinned K calibration evaluates V before this wrapper has attached
-    # the new V-only state. Preserve that K selection exactly.
+    # Retain the parent path when a caller supplies a pre-extension state.
     if 'token_coupling8' not in v_state:
         return params
     beta8 = _state_tensor(v_state, 'token_coupling8', (kv_num_heads,))
+    beta4 = (
+        _state_tensor(v_state, 'token_coupling4', (kv_num_heads,))
+        if 'token_coupling4' in v_state
+        else torch.zeros_like(beta8)
+    )
     beta16 = _state_tensor(v_state, 'token_coupling16', (kv_num_heads,))
+    beta4 = beta4[:, None].expand(kv_num_heads, head_dim).reshape(1, 1, -1)
     beta8 = beta8[:, None].expand(kv_num_heads, head_dim).reshape(1, 1, -1)
     beta16 = beta16[:, None].expand(kv_num_heads, head_dim).reshape(1, 1, -1)
     v = _dequantize_nvfp4_fp32(v_quant, v_scale)
-    return _v_exchange_round(v, params, beta8, beta16)
+    return _v_exchange_round(v, params, beta4, beta8, beta16)
 
 
 def _w_covariance_reliability(transformed_activations,hessian_reg):
