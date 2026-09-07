@@ -35,6 +35,30 @@ and takes 8 seconds more than `def4524`; 3009 points remain to the target.
 Centering and mantissa refinement were submitted together, so their separate
 server contributions are unknown. Local proxy gains are not server points.
 
+### Current isolated candidate: undamped V coupling
+
+The V exchange objective already estimates its permutation-invariant token
+coupling from calibration attention probabilities. The candidate changes only
+the final damping factor from 0.25 to 1.0, using the full measured coefficient.
+It performs exactly the same four legal-mantissa updates and adds no dynamic
+operation relative to `be6ffae`.
+
+- Public Attention full/causal NMSE: `0.00393719/0.00459384` to
+  `0.00390828/0.00456076`.
+- Across three independent six-profile synthetic matrices, both full and
+  causal means improved in every matrix. The original/candidate means were
+  `0.48953/0.36484 -> 0.49526/0.37461`,
+  `0.41013/0.34310 -> 0.41654/0.35334`, and
+  `0.41108/0.34841 -> 0.41751/0.35457`.
+- Captured Qwen full/causal means improved from `0.9366/0.9135` to
+  `0.9382/0.9150`; this is a confirmation set, not the selection set.
+- A coupling of 2.0 was worse than 1.0 on the robust matrix, providing a clear
+  local optimum rather than an unchecked stronger-is-better trend.
+- Official format check: 22/22. Runtime code paths and loop counts are
+  unchanged, so expected server time remains near the 254-second baseline.
+
+This remains an online candidate, not a confirmed score improvement.
+
 The user clarified that 20000 is the minimum competitive algorithm target,
 motivated by another entrant reportedly scoring 22000. There is no known
 20000-point source revision or official standard-converter score. Research must

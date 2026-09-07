@@ -2203,7 +2203,7 @@ _K_MANTISSA_STRENGTH = 0.25
 # For each channel and 16-token segment, minimize
 # sum(error ** 2) + beta * sum(error) ** 2 using only legal mantissa changes.
 _V_TOKEN_GROUP = 16
-_V_TOKEN_COUPLING = 0.25
+_V_TOKEN_COUPLING = 1.0
 _V_TOKEN_UPDATES = 4
 _V_EXCHANGE_CALIBRATION = hif4_calibration_attention
 _V_EXCHANGE_DYNAMIC = hif4_dynamic_quantize_v

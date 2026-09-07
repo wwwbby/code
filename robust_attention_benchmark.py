@@ -124,6 +124,10 @@ def main() -> None:
     parser.add_argument("--k-rank", type=int)
     parser.add_argument("--k-threshold", type=float)
     parser.add_argument("--alpha", type=float)
+    parser.add_argument("--v-coupling", type=float)
+    parser.add_argument("--v-updates", type=int)
+    parser.add_argument("--k-strength", type=float)
+    parser.add_argument("--k-center-mode", choices=("off", "always", "guarded"))
     args = parser.parse_args()
     repo = Path(__file__).resolve().parent
     cases = [make_case(profile, args.seed + index) for index, profile in enumerate(PROFILES)]
@@ -138,6 +142,14 @@ def main() -> None:
         if args.alpha is not None:
             solution._ATTENTION_SMOOTH_ALPHA = args.alpha
             solution._ATTENTION_IMBALANCED_SMOOTH_ALPHA = args.alpha
+        if args.v_coupling is not None:
+            solution._V_TOKEN_COUPLING = args.v_coupling
+        if args.v_updates is not None:
+            solution._V_TOKEN_UPDATES = args.v_updates
+        if args.k_strength is not None:
+            solution._K_MANTISSA_STRENGTH = args.k_strength
+        if args.k_center_mode is not None:
+            solution._K_CENTER_MODE = args.k_center_mode
         if args.min_improvement is not None and hasattr(
             solution, "_ATTENTION_ALPHA_SELECTION_MIN_IMPROVEMENT"
         ):
