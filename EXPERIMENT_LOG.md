@@ -22,7 +22,8 @@ dataset and must not be used to predict the current leaderboard.
 | `fe4b879` | **17675** | **not reported** | **online baseline** | Use full calibrated V token coupling |
 | `04a23c1` | not measured | not measured | pending parent | Nested 8/16-token V coupling plus bit-identical speedups |
 | `a2b0de7` | not measured | not measured | pending parent | Test-time softmax-invariant K translation selection |
-| `92ed4fe` | not measured | not measured | current candidate | Add nested 4-token V error coupling |
+| `92ed4fe` | not measured | not measured | pending parent | Add nested 4-token V error coupling |
+| `9fa93f2` | not measured | not measured | current candidate | Fixed-scale K refinement in softmax quotient space |
 
 The user reported `fe4b879` at 17675 points. It confirms a 167-point gain from
 removing the 0.25 damping while leaving the operation count unchanged. Server
@@ -145,6 +146,34 @@ rounds and one scatter per round.
 
 This is an isolated, near-zero-cost extension on top of the larger dynamic K
 candidate.  Its online contribution must be judged separately from `a2b0de7`.
+
+### Current candidate: appended quotient-space K mantissa refinement
+
+Revision `9fa93f2` retains the existing K Hessian and mantissa result, then
+performs one additional fixed-scale coordinate pass.  Its loss subtracts the
+mean reconstruction error over tokens before applying the already stored
+rank-8 Q covariance.  This exactly removes the K-error component that changes
+each softmax row only by a constant.  The pass does not add a factorization,
+increase the Hessian rank, or search new global/local scales; each block is
+replaced only after at least 1% improvement in the quotient-space objective.
+
+- Four-seed robust full/causal relative score changes
+  `0.472565/0.391965 -> 0.478234/0.394402`; the worst case changes
+  `0.124237 -> 0.143826`.  Both full and causal means improve in every seed.
+- Public changes `0.375203/0.373196 -> 0.373803/0.373821`: full regresses
+  `0.001400`, while causal improves `0.000625`.
+- All three Qwen layers improve in both full and causal evaluation.  The
+  combined public/Qwen mean changes
+  `0.797647/0.779994 -> 0.798219/0.780683`.
+- The 4-seed/public/model matrix takes `36.61 -> 39.36 s`, an increase of
+  2.76 seconds.  This remains well below the time removed by dynamic K's old
+  calibration proxy.  The official format check passes 22/22 in 27.2 seconds.
+- The integrated implementation matches the independent stacked prototype on
+  all 60 selected K parameter tensors and their end-to-end scores.
+
+The public full regression makes this less certain than the dynamic centering
+candidate.  It is kept as a separately identifiable server experiment, not as
+a claim of guaranteed score improvement.
 
 The user clarified that 20000 is the minimum competitive algorithm target,
 motivated by another entrant reportedly scoring 22000. There is no known
@@ -427,3 +456,10 @@ score by about `0.0001`; it is below the promotion threshold.  A bit-exact
 low-rank Hessian implementation eliminated a 64 MiB repeated-factor temporary,
 but the full CPU kernel was 2.5% slower despite a faster isolated projection.
 Neither change is in the submission path.
+
+Extending the V hierarchy once more to 2/4/8/16 regressed both public metrics
+(`0.375203/0.373196 -> 0.374927/0.373030`) and was stopped before a larger
+sweep.  Replacing the existing K mantissa pass with the quotient-space pass was
+also rejected: its one-seed robust causal mean fell
+`0.389681 -> 0.387343`.  Only the appended, guarded form in `9fa93f2` passed
+the multi-seed gate.
