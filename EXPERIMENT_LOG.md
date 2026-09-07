@@ -65,6 +65,30 @@ operation relative to `be6ffae`.
 Server result: 17675 points, a confirmed gain of 167 over `be6ffae`. Runtime is
 still awaiting measurement.
 
+### Current candidate: nested 8/16-token V coupling
+
+The confirmed 16-token exchangeable V objective is decomposed into a shared
+16-token term and two nested 8-token terms. Both coefficients are estimated in
+the same calibration softmax pass. Dynamic rounding keeps the same 16-token
+shape, four update rounds, and one scatter per round; it adds only one small
+sum and cost term. The candidate is stacked on the output-identical performance
+commit, so it remains below the measured runtime of `fe4b879` locally.
+
+- Four independent robust seeds all improve the full+causal aggregate. Mean
+  full changes `0.463125 -> 0.462486`, while the larger causal gain is
+  `0.384078 -> 0.387364`.
+- Public full/causal NMSE improves from `0.00390828/0.00456076` to
+  `0.00388800/0.00453707`.
+- Captured Qwen means improve slightly, and every layer improves on the
+  full+causal aggregate; Qwen was confirmation-only.
+- Public V-kernel timing is unchanged within noise, while end-to-end public
+  Attention measured `8.85 -> 7.90 s` after the output-identical speedups.
+- Official format check: 22/22.
+
+This is a pending online candidate. Do not infer server points from the local
+gain; its purpose is to test whether a more faithful V covariance structure
+continues the server-confirmed V direction.
+
 The user clarified that 20000 is the minimum competitive algorithm target,
 motivated by another entrant reportedly scoring 22000. There is no known
 20000-point source revision or official standard-converter score. Research must
