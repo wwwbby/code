@@ -20,6 +20,8 @@ dataset and must not be used to predict the current leaderboard.
 | `988385e` | 17440 | 252 s | previous baseline | V output-error coupling across 16-token groups |
 | `be6ffae` | 17508 | 254 s | previous baseline | Linear mantissa refinement with covariance reliability |
 | `fe4b879` | **17675** | **not reported** | **online baseline** | Use full calibrated V token coupling |
+| `04a23c1` | not measured | not measured | pending parent | Nested 8/16-token V coupling plus bit-identical speedups |
+| `a2b0de7` | not measured | not measured | current candidate | Test-time softmax-invariant K translation selection |
 
 The user reported `fe4b879` at 17675 points. It confirms a 167-point gain from
 removing the 0.25 damping while leaving the operation count unchanged. Server
@@ -88,6 +90,37 @@ commit, so it remains below the measured runtime of `fe4b879` locally.
 This is a pending online candidate. Do not infer server points from the local
 gain; its purpose is to test whether a more faithful V covariance structure
 continues the server-confirmed V direction.
+
+### Current candidate: dynamic quotient-space K centering
+
+Revision `a2b0de7` replaces the calibration-fitted K centering guard with a
+test-time choice between the original K and a per-head mean-centered K.  For a
+given head, subtracting the same vector from every K token changes each query's
+logits only by one row-wise constant.  Softmax removes that constant exactly,
+so this is a true model symmetry rather than a Qwen-specific approximation.
+
+Both legal HiF4 candidates are scored after removing the token-constant error,
+using the already stored rank-8 Q covariance.  Mean centering is selected per
+KV head only when this quotient-space loss improves by at least 1%.  The final
+K Hessian sweep and mantissa refinement run only once on the selected candidate.
+
+- Four-seed combined regression on top of `04a23c1`: robust full/causal
+  relative score `0.46923/0.38963 -> 0.47278/0.39121`; worst case
+  `0.07652 -> 0.11949`.
+- Public Attention relative score: `0.34223/0.33474 -> 0.37383/0.37176`.
+- All three captured Qwen layers are numerically unchanged in the end-to-end
+  score.  Qwen served only as a rejection set.
+- An eight-seed test against the online `fe4b879` parent improved robust means
+  by `+0.00666` full and `+0.00321` causal, and raised the worst score by
+  `+0.05682`; five of eight seed aggregates improved.
+- The old guard quantized sampled Q/V and two K candidates and evaluated both
+  full and causal attention during calibration.  Removing it more than covers
+  the extra basic K candidate: the four-seed/public/model matrix measured
+  `49.97 -> 34.00 s`, public end-to-end measured `16.54 -> 16.17 s`, and the
+  official output-format check passed 22/22 in 24.15 s.
+
+The candidate is structurally better motivated and locally faster, but its
+score and runtime remain unconfirmed until an exam-server submission.
 
 The user clarified that 20000 is the minimum competitive algorithm target,
 motivated by another entrant reportedly scoring 22000. There is no known
@@ -348,3 +381,10 @@ correlation with `r/(1-r)` slightly regressed multi-seed results because the
 equal-diagonal approximation is imperfect. K midrange centering was also
 strongly worse than mean centering when forced on. None of these changes is in
 the submission path.
+
+A low-cost Q candidate weighted its diagonal quantization objective with the
+calibration K second moment.  Its best square-root weighting improved only two
+of four robust seeds, slightly reduced the causal mean and worst case, reduced
+Qwen layer-0 full attention, and added about 6.8% in its same-batch timing.  It
+is rejected; dynamic Q Hessian or additional Q weighting should not be restored
+without a different generalization argument.
