@@ -126,6 +126,7 @@ def main() -> None:
     parser.add_argument("--alpha", type=float)
     parser.add_argument("--v-coupling", type=float)
     parser.add_argument("--v-updates", type=int)
+    parser.add_argument("--v-group", type=int)
     parser.add_argument("--k-strength", type=float)
     parser.add_argument("--k-center-mode", choices=("off", "always", "guarded"))
     args = parser.parse_args()
@@ -146,6 +147,8 @@ def main() -> None:
             solution._V_TOKEN_COUPLING = args.v_coupling
         if args.v_updates is not None:
             solution._V_TOKEN_UPDATES = args.v_updates
+        if args.v_group is not None:
+            solution._V_TOKEN_GROUP = args.v_group
         if args.k_strength is not None:
             solution._K_MANTISSA_STRENGTH = args.k_strength
         if args.k_center_mode is not None:

@@ -18,7 +18,12 @@ dataset and must not be used to predict the current leaderboard.
 | `e0a19b0` | 16700 | 250 s | rejected | Cross-validated K and per-KV-head alpha selection |
 | `3c40705` | 16991 | 250 s | previous baseline | Guarded K centering plus fixed-scale K mantissa refinement |
 | `988385e` | 17440 | 252 s | previous baseline | V output-error coupling across 16-token groups |
-| `be6ffae` | **17508** | **254 s** | **online baseline** | Linear mantissa refinement with covariance reliability |
+| `be6ffae` | 17508 | 254 s | previous baseline | Linear mantissa refinement with covariance reliability |
+| `fe4b879` | **17675** | **not reported** | **online baseline** | Use full calibrated V token coupling |
+
+The user reported `fe4b879` at 17675 points. It confirms a 167-point gain from
+removing the 0.25 damping while leaving the operation count unchanged. Server
+time has not yet been reported. The remaining gap to 20000 is 2325 points.
 
 The user reported `be6ffae` at 17508 points and 254 seconds. The isolated
 Linear mechanism gains 68 points for 2 seconds. Its small score contribution,
@@ -35,7 +40,7 @@ and takes 8 seconds more than `def4524`; 3009 points remain to the target.
 Centering and mantissa refinement were submitted together, so their separate
 server contributions are unknown. Local proxy gains are not server points.
 
-### Current isolated candidate: undamped V coupling
+### Undamped V coupling (server gain confirmed)
 
 The V exchange objective already estimates its permutation-invariant token
 coupling from calibration attention probabilities. The candidate changes only
@@ -57,7 +62,8 @@ operation relative to `be6ffae`.
 - Official format check: 22/22. Runtime code paths and loop counts are
   unchanged, so expected server time remains near the 254-second baseline.
 
-This remains an online candidate, not a confirmed score improvement.
+Server result: 17675 points, a confirmed gain of 167 over `be6ffae`. Runtime is
+still awaiting measurement.
 
 The user clarified that 20000 is the minimum competitive algorithm target,
 motivated by another entrant reportedly scoring 22000. There is no known
@@ -300,3 +306,21 @@ changing any candidate, tie break, or output tensor. Local times were about
 `21.69--21.80 s` at 8192, and `23.52 s` at 16384. The search chunk is therefore
 8192; the Hessian chunk remains 8192. This is a performance-only change, so its
 expected score is exactly the `def4524` baseline while freeing server headroom.
+
+After the confirmed `fe4b879` result, three additional implementation changes
+preserve every HiF4 output bit: candidate loss now reuses its temporary tensor
+in place; the redundant refinement multiplier 1.0 is omitted from the fast
+path; and K/Linear mantissa refinement keeps Hessian factors grouped by channel
+block instead of copying them once per row. Public Weight, five Activations,
+and all five Q/K/V test outputs matched `fe4b879` element-for-element. The
+generic quantizer microbenchmark improved by roughly 9--12.5%; grouped Linear
+rounding improved by roughly 35% and removed a large repeated-factor buffer.
+The expected server saving is about 15--25 seconds, but only an online timing
+can confirm that estimate.
+
+V rejection tests after `fe4b879`: standalone token groups 8, 32, and 64 did
+not beat group 16 on the full/causal aggregate; converting the measured
+correlation with `r/(1-r)` slightly regressed multi-seed results because the
+equal-diagonal approximation is imperfect. K midrange centering was also
+strongly worse than mean centering when forced on. None of these changes is in
+the submission path.

@@ -74,6 +74,7 @@ _GLOBAL_SCALE_MULTIPLIERS = (
 # candidate (1.0) is always present, and a refined choice is materialized only
 # after a meaningful local weighted-error reduction.
 _REFINEMENT_SCALE_MULTIPLIERS = (0.75, 0.875, 1.0, 1.125, 1.25)
+_FAST_REFINEMENT_SCALE_MULTIPLIERS = (0.75, 0.875, 1.125, 1.25)
 _MIN_REFINEMENT_RELATIVE_IMPROVEMENT = 0.01
 
 # v5: damped 64x64 block-Hessian selection for Linear Weight only.  These
@@ -244,13 +245,13 @@ def _fast_candidate_loss(
         * local_totals[None, None, None, None, None, :]
     )
     values = abs_block[:, None, :, :, :, None]
-    mantissa = (torch.round(values / divisor * 4.0) * 0.25).clamp(
-        min=0.0,
-        max=_HIF4_MAX_MANTISSA,
+    error = values / divisor
+    error.mul_(4.0).round_().mul_(0.25).clamp_(
+        min=0.0, max=_HIF4_MAX_MANTISSA
     )
-    error = (values - mantissa * divisor).square()
+    error.mul_(divisor).sub_(values).square_()
     if weight_block is not None:
-        error = error * weight_block[:, None, :, :, :, None]
+        error.mul_(weight_block[:, None, :, :, :, None])
     loss = error.sum(dim=-2)
     lv2_one = loss[..., 0:2].amin(dim=-1).sum(dim=-1)
     lv2_two = loss[..., 1:3].amin(dim=-1).sum(dim=-1)
@@ -328,7 +329,7 @@ def _quantize_hif4_fast(
 
         if enable_refinement:
             refinement = torch.tensor(
-                _REFINEMENT_SCALE_MULTIPLIERS,
+                _FAST_REFINEMENT_SCALE_MULTIPLIERS,
                 dtype=torch.float32,
                 device=device,
             )
@@ -2077,36 +2078,35 @@ def _k_mantissa_refine(values, params, diagonal, factors, strength):
     exact_diagonal = diagonal + factors.square().sum(-1)
     factors = factors * (strength ** 0.5)
     diagonal = exact_diagonal - factors.square().sum(-1)
-    recon = _k_reconstruct(params, values.shape).reshape(-1, 64)
-    source = values.reshape(-1, 64)
+    recon = _k_reconstruct(params, values.shape).reshape(rows, blocks, 64)
+    source = values.reshape(rows, blocks, 64)
     step = ((params['scale_factor'] * params['scale_lv2']
-             * params['scale_lv3']) / 4).expand_as(params['mant']).reshape(-1, 64)
+             * params['scale_lv3']) / 4).expand_as(params['mant']).reshape(rows, blocks, 64)
     optimized = recon.clone()
-    for start in range(0, len(recon), _HESSIAN_CHUNK_BLOCKS):
-        end = min(start + _HESSIAN_CHUNK_BLOCKS, len(recon))
-        index = torch.arange(start, end, device=values.device) % blocks
-        d, u = diagonal[index], factors[index]
+    hii = diagonal + factors.square().sum(-1)
+    row_chunk = max(1, _HESSIAN_CHUNK_BLOCKS // blocks)
+    for start in range(0, rows, row_chunk):
+        end = min(start + row_chunk, rows)
         y = recon[start:end].clone()
         error = source[start:end] - y
-        projected = torch.bmm(error[:, None, :], u).squeeze(1)
-        old_loss = (d * error.square()).sum(-1) + projected.square().sum(-1)
+        projected = torch.einsum('nbi,bir->nbr', error, factors)
+        old_loss = (diagonal[None] * error.square()).sum(-1) + projected.square().sum(-1)
         for lane in range(64):
-            ui = u[:, lane, :]
-            hii = d[:, lane] + ui.square().sum(-1)
-            he = d[:, lane] * error[:, lane] + (projected * ui).sum(-1)
-            quantum = step[start:end, lane]
-            target = y[:, lane] + he / hii.clamp_min(1e-12)
+            ui = factors[:, lane, :]
+            he = diagonal[None, :, lane] * error[:, :, lane] + (projected * ui[None]).sum(-1)
+            quantum = step[start:end, :, lane]
+            target = y[:, :, lane] + he / hii[None, :, lane].clamp_min(1e-12)
             candidate = (target / quantum).round().clamp(-7, 7) * quantum
-            delta = candidate - y[:, lane]
-            improvement = delta.square() * hii - 2 * delta * he
+            delta = candidate - y[:, :, lane]
+            improvement = delta.square() * hii[None, :, lane] - 2 * delta * he
             delta = torch.where(improvement < 0, delta, 0.)
-            y[:, lane] += delta
-            error[:, lane] -= delta
-            projected -= delta[:, None] * ui
+            y[:, :, lane] += delta
+            error[:, :, lane] -= delta
+            projected -= delta[..., None] * ui[None]
         error = source[start:end] - y
-        projected = torch.bmm(error[:, None, :], u).squeeze(1)
-        loss = (d * error.square()).sum(-1) + projected.square().sum(-1)
-        optimized[start:end] = torch.where((loss < old_loss * .99)[:, None], y, recon[start:end])
+        projected = torch.einsum('nbi,bir->nbr', error, factors)
+        loss = (diagonal[None] * error.square()).sum(-1) + projected.square().sum(-1)
+        optimized[start:end] = torch.where((loss < old_loss * .99)[..., None], y, recon[start:end])
     code = (optimized / step).round().clamp(-7, 7).reshape_as(params['mant'])
     output = dict(params)
     output['sign'] = code.sign().contiguous()
@@ -2337,42 +2337,39 @@ def _w_tail_round(values,params,diagonal,factors,strength):
     rows,channels=values.shape;blocks=channels//64
     exact_diagonal=diagonal+factors.square().sum(-1)
     factors=factors*strength.sqrt();diagonal=exact_diagonal-factors.square().sum(-1)
-    recon=_k_reconstruct(params,values.shape).reshape(-1,64)
-    source=values.reshape(-1,64)
-    step=((params['scale_factor']*params['scale_lv2']*params['scale_lv3'])/4).expand_as(params['mant']).reshape(-1,64)
+    recon=_k_reconstruct(params,values.shape).reshape(rows,blocks,64)
+    source=values.reshape(rows,blocks,64)
+    step=((params['scale_factor']*params['scale_lv2']*params['scale_lv3'])/4).expand_as(params['mant']).reshape(rows,blocks,64)
     optimized=recon.clone()
-    for start in range(0,len(recon),_HESSIAN_CHUNK_BLOCKS):
-        end=min(start+_HESSIAN_CHUNK_BLOCKS,len(recon))
-        index=torch.arange(start,end)%blocks
-        d,u=diagonal[index],factors[index]
-        error=source[start:end]-recon[start:end]
-        projected=torch.bmm(error[:,None,:],u).squeeze(1)
-        gradient=d*error+torch.bmm(u,projected[:,:,None]).squeeze(-1)
-        hii=d+u.square().sum(-1)
-        quantum=step[start:end];codes=(recon[start:end]/quantum).round()
-        bound=.5*quantum*hii*(1-1e-5)
+    hii=diagonal+factors.square().sum(-1)
+    row_chunk=max(1,_HESSIAN_CHUNK_BLOCKS//blocks)
+    for start in range(0,rows,row_chunk):
+        end=min(start+row_chunk,rows)
+        y=recon[start:end].clone()
+        error=source[start:end]-y
+        projected=torch.einsum('nbi,bir->nbr',error,factors)
+        gradient=diagonal[None]*error+torch.matmul(
+            factors[None],projected[...,None]).squeeze(-1)
+        quantum=step[start:end];codes=(y/quantum).round()
+        bound=.5*quantum*hii[None]*(1-1e-5)
         active=(((gradient>=bound)&(codes<7))|((-gradient>=bound)&(codes>-7))).any(-1)
         if not bool(active.any()):continue
-        positions=torch.arange(start,end)[active]
-        d,u=d[active],u[active]
-        y=recon[positions].clone();error=error[active];projected=projected[active]
-        old_loss=(d*error.square()).sum(-1)+projected.square().sum(-1)
-        quantum=step[positions]
+        old_loss=(diagonal[None]*error.square()).sum(-1)+projected.square().sum(-1)
         for lane in range(64):
-            ui=u[:,lane,:]
-            hii=d[:,lane]+ui.square().sum(-1)
-            he=d[:,lane]*error[:,lane]+(projected*ui).sum(-1)
-            q=quantum[:,lane]
-            target=y[:,lane]+he/hii.clamp_min(1e-12)
+            ui=factors[:,lane,:]
+            he=diagonal[None,:,lane]*error[:,:,lane]+(projected*ui[None]).sum(-1)
+            q=quantum[:,:,lane]
+            target=y[:,:,lane]+he/hii[None,:,lane].clamp_min(1e-12)
             candidate=(target/q).round().clamp(-7,7)*q
-            delta=candidate-y[:,lane]
-            improvement=delta.square()*hii-2*delta*he
-            delta=torch.where(improvement<0,delta,0.)
-            y[:,lane]+=delta;error[:,lane]-=delta;projected-=delta[:,None]*ui
-        error=source[positions]-y
-        projected=torch.bmm(error[:,None,:],u).squeeze(1)
-        loss=(d*error.square()).sum(-1)+projected.square().sum(-1)
-        optimized[positions]=torch.where((loss<old_loss*.99)[:,None],y,recon[positions])
+            delta=candidate-y[:,:,lane]
+            improvement=delta.square()*hii[None,:,lane]-2*delta*he
+            delta=torch.where((improvement<0)&active,delta,0.)
+            y[:,:,lane]+=delta;error[:,:,lane]-=delta;projected-=delta[...,None]*ui[None]
+        error=source[start:end]-y
+        projected=torch.einsum('nbi,bir->nbr',error,factors)
+        loss=(diagonal[None]*error.square()).sum(-1)+projected.square().sum(-1)
+        use=(loss<old_loss*.99)&active
+        optimized[start:end]=torch.where(use[...,None],y,recon[start:end])
     code=(optimized/step).round().clamp(-7,7).reshape_as(params['mant'])
     output=dict(params);output['sign']=code.sign().contiguous();output['mant']=(code.abs()/4).contiguous()
     return output
