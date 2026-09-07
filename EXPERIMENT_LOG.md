@@ -21,7 +21,8 @@ dataset and must not be used to predict the current leaderboard.
 | `be6ffae` | 17508 | 254 s | previous baseline | Linear mantissa refinement with covariance reliability |
 | `fe4b879` | **17675** | **not reported** | **online baseline** | Use full calibrated V token coupling |
 | `04a23c1` | not measured | not measured | pending parent | Nested 8/16-token V coupling plus bit-identical speedups |
-| `a2b0de7` | not measured | not measured | current candidate | Test-time softmax-invariant K translation selection |
+| `a2b0de7` | not measured | not measured | pending parent | Test-time softmax-invariant K translation selection |
+| `92ed4fe` | not measured | not measured | current candidate | Add nested 4-token V error coupling |
 
 The user reported `fe4b879` at 17675 points. It confirms a 167-point gain from
 removing the 0.25 damping while leaving the operation count unchanged. Server
@@ -121,6 +122,29 @@ K Hessian sweep and mantissa refinement run only once on the selected candidate.
 
 The candidate is structurally better motivated and locally faster, but its
 score and runtime remain unconfirmed until an exam-server submission.
+
+### Current candidate: nested 4/8/16-token V coupling
+
+Revision `92ed4fe` adds a four-token level to the existing nested V objective.
+The measured average within-group correlations at lengths 4, 8 and 16 are
+decomposed into non-negative hierarchical coefficients.  Dynamic rounding adds
+one four-token reduction and one cost term, while retaining exactly four update
+rounds and one scatter per round.
+
+- Across four independent robust seeds, every full+causal aggregate improves;
+  causal improves in all four and full improves in three.  Mean full/causal
+  changes `0.463647/0.388722 -> 0.463849/0.389570`.
+- Public full/causal relative score changes
+  `0.373832/0.371760 -> 0.375203/0.373196`.
+- Captured Qwen mean changes `0.953928/0.939556 -> 0.953943/0.939725`.
+  One layer's full score moves down by only `0.000026`, while its causal score
+  and the three-layer aggregate improve.
+- Public V-kernel timing is unchanged within noise (`0.2580 -> 0.2492 s`).
+  The official format check passes 22/22, and the integrated public V outputs
+  match the independent prototype across all 25 parameter tensors.
+
+This is an isolated, near-zero-cost extension on top of the larger dynamic K
+candidate.  Its online contribution must be judged separately from `a2b0de7`.
 
 The user clarified that 20000 is the minimum competitive algorithm target,
 motivated by another entrant reportedly scoring 22000. There is no known
@@ -388,3 +412,18 @@ of four robust seeds, slightly reduced the causal mean and worst case, reduced
 Qwen layer-0 full attention, and added about 6.8% in its same-batch timing.  It
 is rejected; dynamic Q Hessian or additional Q weighting should not be restored
 without a different generalization argument.
+
+Two extensions to the dynamic K selector were also rejected.  Re-centering
+from the direct candidate's mean residual hurt causal attention immediately.
+One fixed-point step after mean centering improved the four-seed mean, but only
+two seeds won under its conservative gate, its gain was concentrated in the
+short d64 profile, q-heavy causal attention regressed, and it added about 6.1%
+to the matrix runtime.  The submitted selector therefore remains exactly
+`none/mean`, with one final Hessian refinement.
+
+Using the exact coordinate gradient instead of the 16-token residual sum for V
+rounding changed robust means by only a few millionths and improved the public
+score by about `0.0001`; it is below the promotion threshold.  A bit-exact
+low-rank Hessian implementation eliminated a 64 MiB repeated-factor temporary,
+but the full CPU kernel was 2.5% slower despite a faster isolated projection.
+Neither change is in the submission path.
