@@ -2187,16 +2187,118 @@ def hif4_calibration_attention(calib_qkv_list, q_num_heads, kv_num_heads, head_d
     return states
 
 
-def hif4_dynamic_quantize_k(k_quant, k_scale, kv_num_heads, head_dim, k_state):
-    enabled = k_state.get('center_enabled')
-    if _K_MANTISSA_STRENGTH == 0 and (enabled is None or not bool(enabled.any())):
-        return _K_BASE_DYNAMIC(k_quant, k_scale, kv_num_heads, head_dim, k_state)
-    _validate_attention_shape(k_quant, kv_num_heads, head_dim, 'k')
-    k = _dequantize_nvfp4_fp32(k_quant, k_scale)
-    return _k_quantize_value(k, kv_num_heads, head_dim, k_state, enabled)
-
 _K_CENTER_MODE = 'guarded'
 _K_MANTISSA_STRENGTH = 0.25
+_K_DYNAMIC_CENTER_IMPROVEMENT = 0.01
+
+
+def _k_quotient_loss(target, params, rows, heads, blocks, diagonal, factors):
+    """Score K error after removing softmax-invariant token constants."""
+    reconstructed = _k_reconstruct(params, target.shape).reshape(
+        rows, heads, blocks, 64
+    )
+    error = target.reshape(rows, heads, blocks, 64) - reconstructed
+    error -= error.mean(dim=0, keepdim=True)
+    loss = (error.square() * diagonal[None]).sum(dim=(0, 2, 3))
+    projected = torch.einsum('thbi,hbir->thbr', error, factors)
+    return loss + projected.square().sum(dim=(0, 2, 3))
+
+
+def hif4_dynamic_quantize_k(k_quant, k_scale, kv_num_heads, head_dim, k_state):
+    """Choose a free per-head K translation from the current tensor itself.
+
+    Subtracting one fixed vector from every token of a K head adds only a
+    row-wise constant to QK^T, which softmax cancels exactly.  We use that
+    quotient-space freedom only when mean centering lowers the stored
+    Q-covariance loss by at least one percent.
+    """
+    _validate_attention_shape(k_quant, kv_num_heads, head_dim, 'k')
+    k = _dequantize_nvfp4_fp32(k_quant, k_scale)
+    rows = int(k.shape[0])
+    values = k.reshape(rows, kv_num_heads, head_dim)
+    smooth = _state_tensor(
+        k_state, 'smooth_scale', (kv_num_heads, head_dim)
+    )
+    base_target = _apply_attention_hadamard(
+        (values * smooth[None]).reshape_as(k), kv_num_heads, head_dim
+    ).reshape(rows, kv_num_heads, head_dim)
+    mean_target = _apply_attention_hadamard(
+        (
+            (values - values.mean(dim=0, keepdim=True)) * smooth[None]
+        ).reshape_as(k),
+        kv_num_heads,
+        head_dim,
+    ).reshape(rows, kv_num_heads, head_dim)
+    base_params = _quantize_hif4(base_target.reshape_as(k))
+    mean_params = _quantize_hif4(mean_target.reshape_as(k))
+
+    blocks = head_dim // 64
+    diagonal = _state_tensor(
+        k_state, 'hessian_diagonal', (kv_num_heads * blocks, 64)
+    ).reshape(kv_num_heads, blocks, 64)
+    factors = _state_tensor(
+        k_state,
+        'hessian_factors',
+        (kv_num_heads * blocks, 64, _ATTENTION_K_HESSIAN_RANK),
+    ).reshape(kv_num_heads, blocks, 64, _ATTENTION_K_HESSIAN_RANK)
+    base_loss = _k_quotient_loss(
+        base_target,
+        base_params,
+        rows,
+        kv_num_heads,
+        blocks,
+        diagonal,
+        factors,
+    )
+    mean_loss = _k_quotient_loss(
+        mean_target,
+        mean_params,
+        rows,
+        kv_num_heads,
+        blocks,
+        diagonal,
+        factors,
+    )
+    use_mean = mean_loss < base_loss * (1.0 - _K_DYNAMIC_CENTER_IMPROVEMENT)
+
+    target = torch.where(
+        use_mean[None, :, None], mean_target, base_target
+    ).reshape_as(k)
+    selected = {}
+    for name, base in base_params.items():
+        tail = base.shape[2:]
+        base_by_head = base.reshape(rows, kv_num_heads, blocks, *tail)
+        mean_by_head = mean_params[name].reshape(
+            rows, kv_num_heads, blocks, *tail
+        )
+        mask = use_mean.reshape(
+            1, kv_num_heads, 1, *([1] * len(tail))
+        )
+        selected[name] = torch.where(
+            mask, mean_by_head, base_by_head
+        ).reshape_as(base)
+
+    diagonal = diagonal.reshape(kv_num_heads * blocks, 64)
+    factors = factors.reshape(
+        kv_num_heads * blocks, 64, _ATTENTION_K_HESSIAN_RANK
+    )
+    output = _quantize_hif4_low_rank_hessian(
+        target,
+        None,
+        selected,
+        precomputed_factors=(diagonal, factors),
+        sweep_rounds=_ATTENTION_K_HESSIAN_SWEEPS,
+        min_replace_improvement=_ATTENTION_K_HESSIAN_MIN_REPLACE_IMPROVEMENT,
+    )
+    if _K_MANTISSA_STRENGTH > 0:
+        output = _k_mantissa_refine(
+            target,
+            output,
+            diagonal,
+            factors,
+            _K_MANTISSA_STRENGTH,
+        )
+    return output
 
 
 # V quantization with a calibration-derived, permutation-invariant token metric.
@@ -2205,7 +2307,9 @@ _K_MANTISSA_STRENGTH = 0.25
 _V_TOKEN_GROUP = 16
 _V_TOKEN_COUPLING = 1.0
 _V_TOKEN_UPDATES = 4
-_V_EXCHANGE_CALIBRATION = hif4_calibration_attention
+# Test-time quotient selection supersedes the slower calibration-time K guard.
+# The final wrapper below still attaches both nested V coupling coefficients.
+_V_EXCHANGE_CALIBRATION = _K_BASE_CALIBRATION
 _V_EXCHANGE_DYNAMIC = hif4_dynamic_quantize_v
 
 
