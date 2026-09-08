@@ -90,9 +90,9 @@ _HESSIAN_LOW_RANK_SWEEPS = 1
 # quantized activation compensate for the already-quantized Weight.  The
 # strength was selected on generic distribution families; the public and
 # captured-model tensors are confirmation sets only.
-_LINEAR_JOINT_STRENGTH = 0.125
+_LINEAR_JOINT_STRENGTH = 0.21875
 _LINEAR_JOINT_MIN_IMPROVEMENT = 0.001
-_LINEAR_JOINT_PLAIN_MSE_CAP = 0.01
+_LINEAR_JOINT_PLAIN_MSE_CAP = 0.15
 
 
 # =============================================================================
@@ -1699,9 +1699,23 @@ def _refine_linear_activation_joint(
     reference_loss = torch.einsum(
         "nbi,bij,nbj->nb", baseline_error, gram, baseline_error
     ).clamp_min(1.0e-12)
-    use = -objective_change > _LINEAR_JOINT_MIN_IMPROVEMENT * reference_loss
+    # HiF4 shares scale hierarchy only within a 64-value block, but Linear
+    # output error accumulates over the entire channel row.  Accepting each
+    # block independently rejects useful compensating changes: a modest plain
+    # MSE increase in one block can be more than repaid by its interaction
+    # with the already-quantized Weight.  Keep the coordinate search block
+    # local, then apply one conservative decision to the complete token.
+    objective_improvement = -objective_change.sum(dim=-1)
+    reference_loss = reference_loss.sum(dim=-1)
+    old_plain = old_plain.sum(dim=-1)
+    new_plain = new_plain.sum(dim=-1)
+    use = objective_improvement > (
+        _LINEAR_JOINT_MIN_IMPROVEMENT * reference_loss
+    )
     use &= new_plain <= old_plain * (1.0 + _LINEAR_JOINT_PLAIN_MSE_CAP)
-    codes = torch.where(use[..., None], codes, (baseline / step).round())
+    codes = torch.where(
+        use[:, None, None], codes, (baseline / step).round()
+    )
     codes = codes.clamp(-7.0, 7.0).reshape_as(params["mant"])
     output = dict(params)
     output["sign"] = codes.sign().contiguous()
@@ -1891,8 +1905,8 @@ def hif4_calibration_and_quantize_weight(
     )
     state = _make_state("activation")
     state.update({
-        "schema_version": 8,
-        "algorithm": "hif4-asymmetric-linear-reconstruction",
+        "schema_version": 9,
+        "algorithm": "hif4-token-guarded-asymmetric-linear-reconstruction",
         "smooth_scale": smooth.detach().cpu().contiguous(),
         "error_weights": activation_importance.detach().cpu().contiguous(),
         "joint_gram": joint_gram,
