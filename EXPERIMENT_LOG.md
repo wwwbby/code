@@ -26,6 +26,7 @@ dataset and must not be used to predict the current leaderboard.
 | `768a670` | 18178 | 233 s | previous baseline | Speedups, nested V and dynamic K translation selection |
 | `9fa93f2` | not measured | not measured | submitted code parent | Fixed-scale K refinement in softmax quotient space |
 | `8d88fbc` | **18182** | **230 s** | **online baseline** | Append fixed-scale K quotient-space refinement |
+| `0ff81b5` | not measured | not measured | submitted candidate | Asymmetric Dynamic Activation reconstruction against quantized Weight |
 
 The user reported `768a670` at 18178 points in 233 seconds.  Relative to the
 previous online baseline `fe4b879`, the bundled branch gains 503 points.  Its
@@ -42,6 +43,30 @@ the favorable direction.  The mechanism remains in the best revision, but
 further K Hessian/mantissa expansion is stopped because the much larger local
 proxy gain did not transfer.  The remaining gap to 20000 is 1818 points, with
 70 seconds of measured timeout headroom.
+
+Revision `0ff81b5` leaves Weight and all Attention parameters bitwise identical
+to `8d88fbc`.  It stores block-local `What^T What` and `What^T W` statistics in
+the Linear activation state, then performs one fixed-scale legal-mantissa pass
+on each dynamic Activation.  A conservative strength of `0.125` was selected
+on generic distribution families, and each changed block must improve the
+asymmetric objective while increasing plain reconstruction MSE by at most 1%.
+This directly models the fact that the opposite Weight operand has already
+been quantized; it does not compute a calibration `A @ W` target.
+
+- Four independent nine-family robust seeds improve in aggregate by
+  `+0.0152` to `+0.0188`; 35 of 36 individual distribution cases improve and
+  the sole regression is `0.00027`.
+- The non-Qwen public Linear relative score changes `0.77598 -> 0.78208`.
+- All three captured Qwen Linear layers improve, with their mean changing
+  `0.44797 -> 0.45382`; Qwen is confirmation-only.
+- Final same-process public timing changes `26.01 -> 26.60 s`.  The Weight
+  output is bitwise unchanged, all five Q/K/V outputs are bitwise unchanged,
+  and the official format check passes `22/22`.
+
+The candidate is intentionally isolated for an online measurement.  Its local
+gain is much broader than the saturated K quotient refinement, while its
+measured cost is small relative to the 70-second server headroom.  It is not
+assumed to close the full 1818-point gap by itself.
 
 The user reported `fe4b879` at 17675 points. It confirms a 167-point gain from
 removing the 0.25 damping while leaving the operation count unchanged. Server
@@ -483,3 +508,19 @@ sweep.  Replacing the existing K mantissa pass with the quotient-space pass was
 also rejected: its one-seed robust causal mean fell
 `0.389681 -> 0.387343`.  Only the appended, guarded form in `9fa93f2` passed
 the multi-seed gate.
+
+Two later V experiments were also stopped.  Adding shifted 4/8/16-token
+partitions produced only a tiny public causal gain while reducing the first
+robust seed's full score by `0.0021`.  Replacing the exchangeable hierarchy
+with calibration-fitted 16-token position Hessians was much worse: even the
+mildest tested off-diagonal strengths reduced both public full and causal
+scores, and stronger variants became negative.  Position-specific calibration
+correlations therefore do not transfer reliably; keep the permutation-
+invariant V hierarchy unless a new independent signal is available.
+
+A one-round V local-scale pass under the existing nested objective changed the
+public full/causal score only `0.373803/0.373821 -> 0.375184/0.375064` while
+roughly doubling the isolated refinement-kernel time.  A second round and
+nearby global-scale candidates added negligible quality.  This is below the
+promotion threshold after the server showed that much larger K proxy changes
+were worth only four points, so no V scale pass is included in `0ff81b5`.
