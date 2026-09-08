@@ -86,6 +86,14 @@ _HESSIAN_MIN_REPLACE_IMPROVEMENT = 0.01
 _HESSIAN_LOW_RANK = 32
 _HESSIAN_LOW_RANK_SWEEPS = 1
 
+# A small amount of asymmetric Linear reconstruction lets the dynamically
+# quantized activation compensate for the already-quantized Weight.  The
+# strength was selected on generic distribution families; the public and
+# captured-model tensors are confirmation sets only.
+_LINEAR_JOINT_STRENGTH = 0.125
+_LINEAR_JOINT_MIN_IMPROVEMENT = 0.001
+_LINEAR_JOINT_PLAIN_MSE_CAP = 0.01
+
 
 # =============================================================================
 # NVFP4 helper
@@ -1574,6 +1582,133 @@ def _calibrate_attention_smooth_v(
     return {"q_state": q_state, "k_state": k_state, "v_state": v_state}
 
 
+def _reconstruct_hif4_fp32(
+    params: dict[str, torch.Tensor], shape: tuple[int, ...]
+) -> torch.Tensor:
+    """Materialize legal HiF4 parameters without a BF16 round trip."""
+
+    return (
+        params["sign"].float()
+        * params["mant"].float()
+        * params["scale_lv3"].float()
+        * params["scale_lv2"].float()
+        * params["scale_factor"].float()
+    ).reshape(shape)
+
+
+def _linear_joint_statistics(
+    transformed_weight: torch.Tensor,
+    weight_params: dict[str, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build block-local What^T What and What^T W statistics.
+
+    These matrices use Weight only and never form a calibration A @ W target.
+    They let the online activation quantizer account for the fact that the
+    opposite operand has already been quantized.
+    """
+
+    rows, channels = transformed_weight.shape
+    blocks = channels // _HIF4_BLOCK_SIZE
+    target = transformed_weight.reshape(rows, blocks, _HIF4_BLOCK_SIZE)
+    quantized = _reconstruct_hif4_fp32(
+        weight_params, tuple(transformed_weight.shape)
+    ).reshape_as(target)
+    gram = torch.einsum("mbi,mbj->bij", quantized, quantized)
+    cross = torch.einsum("mbi,mbj->bij", quantized, target)
+    normalization = torch.diagonal(
+        gram, dim1=-2, dim2=-1
+    ).mean(dim=-1).clamp_min(1.0e-8)
+    return (
+        (gram / normalization[:, None, None]).cpu().contiguous(),
+        (cross / normalization[:, None, None]).cpu().contiguous(),
+    )
+
+
+def _refine_linear_activation_joint(
+    values: torch.Tensor,
+    params: dict[str, torch.Tensor],
+    state: Any,
+) -> dict[str, torch.Tensor]:
+    """Refine fixed-scale activation codes under an asymmetric W/What loss."""
+
+    channels = int(values.shape[-1])
+    rows = values.numel() // channels
+    blocks = channels // _HIF4_BLOCK_SIZE
+    source = values.reshape(rows, blocks, _HIF4_BLOCK_SIZE)
+    baseline = _reconstruct_hif4_fp32(params, tuple(values.shape)).reshape_as(
+        source
+    )
+    gram = _state_tensor(
+        state,
+        "joint_gram",
+        (blocks, _HIF4_BLOCK_SIZE, _HIF4_BLOCK_SIZE),
+    )
+    cross = _state_tensor(
+        state,
+        "joint_cross",
+        (blocks, _HIF4_BLOCK_SIZE, _HIF4_BLOCK_SIZE),
+    )
+    diagonal = torch.diagonal(gram, dim1=-2, dim2=-1)
+    diagonal_matrix = torch.diag_embed(diagonal)
+    strength = _LINEAR_JOINT_STRENGTH
+    gram = diagonal_matrix + strength * (gram - diagonal_matrix)
+    cross_diagonal = torch.diagonal(cross, dim1=-2, dim2=-1)
+    cross = diagonal_matrix + strength * (cross - diagonal_matrix)
+    torch.diagonal(cross, dim1=-2, dim2=-1).copy_(
+        diagonal + strength * (cross_diagonal - diagonal)
+    )
+
+    step = (
+        params["scale_factor"].float()
+        * params["scale_lv2"].float()
+        * params["scale_lv3"].float()
+    ).expand_as(params["mant"]).reshape_as(source) * 0.25
+    quantized = baseline.clone()
+    codes = (quantized / step).round().clamp(-7.0, 7.0)
+    old_plain = (source - baseline).square().sum(dim=-1)
+    gradient = torch.einsum("bij,nbj->nbi", cross, source)
+    gradient -= torch.einsum("bij,nbj->nbi", gram, quantized)
+    objective_change = torch.zeros_like(old_plain)
+    for lane in range(_HIF4_BLOCK_SIZE):
+        curvature = gram[:, lane, lane].clamp_min(1.0e-12)
+        target = (
+            quantized[:, :, lane]
+            + gradient[:, :, lane] / curvature[None]
+        )
+        candidate_code = (
+            target / step[:, :, lane]
+        ).round().clamp(-7.0, 7.0)
+        delta = candidate_code * step[:, :, lane] - quantized[:, :, lane]
+        candidate_change = (
+            delta.square() * curvature[None]
+            - 2.0 * delta * gradient[:, :, lane]
+        )
+        accepted_change = torch.where(
+            candidate_change < 0.0, candidate_change, 0.0
+        )
+        delta = torch.where(candidate_change < 0.0, delta, 0.0)
+        objective_change += accepted_change
+        quantized[:, :, lane] += delta
+        codes[:, :, lane] = (
+            quantized[:, :, lane] / step[:, :, lane]
+        ).round().clamp(-7.0, 7.0)
+        gradient -= delta[..., None] * gram[:, :, lane][None]
+
+    new_plain = (source - quantized).square().sum(dim=-1)
+    baseline_error = source - baseline
+    reference_loss = torch.einsum(
+        "nbi,bij,nbj->nb", baseline_error, gram, baseline_error
+    ).clamp_min(1.0e-12)
+    use = -objective_change > _LINEAR_JOINT_MIN_IMPROVEMENT * reference_loss
+    use &= new_plain <= old_plain * (1.0 + _LINEAR_JOINT_PLAIN_MSE_CAP)
+    codes = torch.where(use[..., None], codes, (baseline / step).round())
+    codes = codes.clamp(-7.0, 7.0).reshape_as(params["mant"])
+    output = dict(params)
+    output["sign"] = codes.sign().contiguous()
+    output["mant"] = (codes.abs() * 0.25).contiguous()
+    return output
+
+
 # =============================================================================
 # 返回值公共说明
 # =============================================================================
@@ -1751,12 +1886,18 @@ def hif4_calibration_and_quantize_weight(
     )
 
     activation_importance = transformed_weight.square().sum(dim=0).clamp_min(1.0e-8)
+    joint_gram, joint_cross = _linear_joint_statistics(
+        transformed_weight, weight_params
+    )
     state = _make_state("activation")
     state.update({
-        "schema_version": 7,
-        "algorithm": "hif4-fast-low-rank-hessian",
+        "schema_version": 8,
+        "algorithm": "hif4-asymmetric-linear-reconstruction",
         "smooth_scale": smooth.detach().cpu().contiguous(),
         "error_weights": activation_importance.detach().cpu().contiguous(),
+        "joint_gram": joint_gram,
+        "joint_cross": joint_cross,
+        "joint_strength": _LINEAR_JOINT_STRENGTH,
         "smooth_alpha": _LINEAR_SMOOTH_ALPHA,
         "rotation": "signed-hadamard-64",
     })
@@ -1806,7 +1947,8 @@ def hif4_dynamic_quantize_activation(
     )
     activation = _dequantize_nvfp4_fp32(activation_quant, activation_scale)
     transformed = _apply_block_hadamard(activation / smooth)
-    return _quantize_hif4(transformed, error_weights)
+    params = _quantize_hif4(transformed, error_weights)
+    return _refine_linear_activation_joint(transformed, params, activation_state)
 
 
 # =============================================================================
