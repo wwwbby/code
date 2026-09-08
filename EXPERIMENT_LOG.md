@@ -27,6 +27,7 @@ dataset and must not be used to predict the current leaderboard.
 | `9fa93f2` | not measured | not measured | submitted code parent | Fixed-scale K refinement in softmax quotient space |
 | `8d88fbc` | **18182** | **230 s** | **online baseline** | Append fixed-scale K quotient-space refinement |
 | `0ff81b5` | not measured | not measured | submitted candidate | Asymmetric Dynamic Activation reconstruction against quantized Weight |
+| `06250ad` | not measured | not measured | submitted candidate | Token-level guard for asymmetric Dynamic Activation refinement |
 
 The user reported `768a670` at 18178 points in 233 seconds.  Relative to the
 previous online baseline `fe4b879`, the bundled branch gains 503 points.  Its
@@ -67,6 +68,32 @@ The candidate is intentionally isolated for an online measurement.  Its local
 gain is much broader than the saturated K quotient refinement, while its
 measured cost is small relative to the 70-second server headroom.  It is not
 assumed to close the full 1818-point gap by itself.
+
+Revision `06250ad` changes the acceptance unit of the asymmetric Activation
+pass from each independent 64-channel block to the complete token.  The legal
+mantissa coordinate search is still block-local and still runs exactly once,
+but a token is accepted only when its aggregate asymmetric objective improves.
+This admits compensating changes that the old 1% per-block plain-MSE cap
+discarded.  A 15% token-level plain-MSE cap remains as a distribution guard;
+the asymmetric coupling is `7/32`, selected on generic distributions rather
+than the public or captured-model tensors.
+
+- Across eight independent nine-family synthetic seeds, every aggregate
+  improves.  The prototype mean rises from `0.061--0.085` to `0.233--0.252`,
+  a per-seed gain of approximately `+0.158` to `+0.174`; all tested families
+  improve, including heavy-tail, sparse-outlier and low-rank cases.
+- Non-Qwen public Linear changes `0.78208 -> 0.82433`.
+- Captured Qwen Linear mean changes `0.45383 -> 0.46047`; all three layers
+  improve, and Qwen remains confirmation-only.
+- Same-process public timing is `25.45 -> 25.55 s`.  No extra coordinate
+  sweep, scale candidate, factorization or matrix product was added.
+- Weight is bitwise unchanged and every Attention Q/K/V output is bitwise
+  unchanged relative to `8d88fbc`; the official output-format check remains
+  `22/22`.
+
+This is a substantially stronger, effectively runtime-neutral successor to
+`0ff81b5`.  The analytic V prefix candidate remains separate so the next
+server result can be attributed to the Linear acceptance change.
 
 The user reported `fe4b879` at 17675 points. It confirms a 167-point gain from
 removing the 0.25 damping while leaving the operation count unchanged. Server
