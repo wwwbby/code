@@ -25,9 +25,10 @@ dataset and must not be used to predict the current leaderboard.
 | `92ed4fe` | not measured | not measured | pending parent | Add nested 4-token V error coupling |
 | `768a670` | 18178 | 233 s | previous baseline | Speedups, nested V and dynamic K translation selection |
 | `9fa93f2` | not measured | not measured | submitted code parent | Fixed-scale K refinement in softmax quotient space |
-| `8d88fbc` | **18182** | **230 s** | **online baseline** | Append fixed-scale K quotient-space refinement |
+| `8d88fbc` | 18182 | 230 s | previous baseline | Append fixed-scale K quotient-space refinement |
 | `0ff81b5` | not measured | not measured | submitted candidate | Asymmetric Dynamic Activation reconstruction against quantized Weight |
 | `06250ad` | not measured | not measured | submitted candidate | Token-level guard for asymmetric Dynamic Activation refinement |
+| `3e93bd2` | **18417** | **232 s** | **online baseline** | Record token-guarded asymmetric Activation candidate |
 
 The user reported `768a670` at 18178 points in 233 seconds.  Relative to the
 previous online baseline `fe4b879`, the bundled branch gains 503 points.  Its
@@ -94,6 +95,51 @@ than the public or captured-model tensors.
 This is a substantially stronger, effectively runtime-neutral successor to
 `0ff81b5`.  The analytic V prefix candidate remains separate so the next
 server result can be attributed to the Linear acceptance change.
+
+The user reported `3e93bd2` at 18417 points in 232 seconds.  Relative to
+`8d88fbc`, the isolated token-guarded asymmetric Activation path gains 235
+server points for 2 seconds.  This promotes it to the online baseline, leaving
+1583 points to 20000 and 68 seconds below the hard timeout.  The gain confirms
+that quantized-opponent reconstruction transfers, but its much larger local
+Linear improvement maps to modest server weight; further Linear coordinate
+sweeps or covariance sketches are therefore stopped.  The next candidate uses
+the remaining budget on V/Attention and remains isolated from Linear changes.
+
+### Random exam-like trend dataset
+
+The hidden exam tensors may be generated rather than copied from an open model.
+The supplied sparse sample supports that possibility: it uses the same five
+widely separated sequence lengths for calibration and test, has negligible
+adjacent-channel correlation, and combines log-scale channel variation with
+rare heavy tails.  Qwen is therefore removed from candidate selection and kept
+only as an optional catastrophic-regression guard.
+
+`random_exam_dataset.py` freezes a reproducible seed recipe and materializes
+the organizer's exact `linear.pt` / `attn.pt` interfaces.  The current set has
+five Linear groups and four Attention groups, independent derived seeds, and
+the following coverage:
+
+- IID, lognormal channel scaling, AR channel correlation, sparse heavy tails,
+  and a public-like extreme sparse-activation family;
+- GQA, MHA and MQA with head dimensions 128 and 256;
+- calibration and test lengths from 16 through 1024 tokens;
+- approximately 95 MB of generated NVFP4 carriers, excluded from Git because
+  the tracked generator and manifest reproduce them exactly.
+
+`online_trend_dataset.py` replayed eleven measured revisions from `d75e03a`
+through `3e93bd2`.  Only a two-source standardized mixture was fitted; there
+are no per-revision, per-profile or Qwen weights.  The frozen mixture is
+Attention `0.6000` and Linear `0.4000`.  It reproduces the known online order
+with Spearman correlation `0.9909` and `98.18%` pairwise accuracy.  The single
+reversal is `5b922c8` versus `a649209`; those two have identical random
+Attention outputs and their random Linear proxy moves opposite to the server.
+The affine point fit has mean absolute error about 282 points, so the dataset
+is a trend/ranking gate, not an absolute leaderboard predictor.
+
+The generated dataset passes the organizer interface validator `94/94` on the
+current worktree in 19.23 seconds.  Future candidates should first improve the
+random trend score, then pass public/Qwen regression guards and a separate
+runtime gate.  A local gain on Qwen alone is no longer promotion evidence.
 
 The user reported `fe4b879` at 17675 points. It confirms a 167-point gain from
 removing the 0.25 damping while leaving the operation count unchanged. Server

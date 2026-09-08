@@ -1,0 +1,291 @@
+{
+  "schema": 1,
+  "seed": 20260908,
+  "sample_lengths": [
+    16,
+    64,
+    192,
+    384,
+    1024,
+    16,
+    64,
+    192,
+    384,
+    1024
+  ],
+  "linear_profiles": [
+    {
+      "name": "iid-d512",
+      "channels": 512,
+      "rows": 768,
+      "family": "iid",
+      "channel_spread": 0.0,
+      "tail_probability": 0.0,
+      "correlation": 0.0
+    },
+    {
+      "name": "channel-scaled-d1024",
+      "channels": 1024,
+      "rows": 768,
+      "family": "channel_scaled",
+      "channel_spread": 0.85,
+      "tail_probability": 0.0,
+      "correlation": 0.0
+    },
+    {
+      "name": "correlated-d1024",
+      "channels": 1024,
+      "rows": 512,
+      "family": "correlated",
+      "channel_spread": 0.0,
+      "tail_probability": 0.0,
+      "correlation": 0.82
+    },
+    {
+      "name": "sparse-tail-d768",
+      "channels": 768,
+      "rows": 512,
+      "family": "sparse_tail",
+      "channel_spread": 0.0,
+      "tail_probability": 0.012,
+      "correlation": 0.0
+    },
+    {
+      "name": "public-like-d1024",
+      "channels": 1024,
+      "rows": 512,
+      "family": "public_like",
+      "channel_spread": 0.55,
+      "tail_probability": 0.0015,
+      "correlation": 0.0
+    }
+  ],
+  "attention_profiles": [
+    {
+      "name": "gqa-iid-h8-kv2-d128",
+      "q_heads": 8,
+      "kv_heads": 2,
+      "head_dim": 128,
+      "family": "iid",
+      "channel_spread": 0.0,
+      "tail_probability": 0.0,
+      "q_rms": 1.0,
+      "k_rms": 1.0,
+      "v_token_correlation": 0.0
+    },
+    {
+      "name": "gqa-scaled-h16-kv2-d128",
+      "q_heads": 16,
+      "kv_heads": 2,
+      "head_dim": 128,
+      "family": "channel_scaled",
+      "channel_spread": 0.75,
+      "tail_probability": 0.0,
+      "q_rms": 1.0,
+      "k_rms": 1.0,
+      "v_token_correlation": 0.0
+    },
+    {
+      "name": "mha-tail-h4-d128",
+      "q_heads": 4,
+      "kv_heads": 4,
+      "head_dim": 128,
+      "family": "sparse_tail",
+      "channel_spread": 0.0,
+      "tail_probability": 0.01,
+      "q_rms": 1.0,
+      "k_rms": 1.0,
+      "v_token_correlation": 0.0
+    },
+    {
+      "name": "mqa-correlated-h8-d256",
+      "q_heads": 8,
+      "kv_heads": 1,
+      "head_dim": 256,
+      "family": "correlated",
+      "channel_spread": 0.0,
+      "tail_probability": 0.0,
+      "q_rms": 1.2,
+      "k_rms": 1.2,
+      "v_token_correlation": 0.72
+    }
+  ],
+  "statistics": {
+    "linear": {
+      "iid-d512": {
+        "weight": {
+          "rms": 0.9999680519104004,
+          "peak_over_rms": 5.015785217285156,
+          "kurtosis": 3.099769353866577,
+          "channel_log2_rms_std": 0.03732004016637802,
+          "adjacent_correlation": -0.00022072518186178058
+        },
+        "activation": {
+          "rms": 1.0004937648773193,
+          "peak_over_rms": 5.528520107269287,
+          "kurtosis": 3.5280113220214844,
+          "channel_log2_rms_std": 0.035633962601423264,
+          "adjacent_correlation": 0.00023605684691574425
+        }
+      },
+      "channel-scaled-d1024": {
+        "weight": {
+          "rms": 1.0002490282058716,
+          "peak_over_rms": 8.857169151306152,
+          "kurtosis": 5.344498634338379,
+          "channel_log2_rms_std": 0.5851050019264221,
+          "adjacent_correlation": 0.00038529650191776454
+        },
+        "activation": {
+          "rms": 1.001726508140564,
+          "peak_over_rms": 14.974146842956543,
+          "kurtosis": 16.225309371948242,
+          "channel_log2_rms_std": 1.1490154266357422,
+          "adjacent_correlation": -0.00033774159965105355
+        }
+      },
+      "correlated-d1024": {
+        "weight": {
+          "rms": 1.000730276107788,
+          "peak_over_rms": 4.730920314788818,
+          "kurtosis": 3.1240487098693848,
+          "channel_log2_rms_std": 0.05070534721016884,
+          "adjacent_correlation": 0.6394630074501038
+        },
+        "activation": {
+          "rms": 1.0007351636886597,
+          "peak_over_rms": 6.323476314544678,
+          "kurtosis": 3.529081344604492,
+          "channel_log2_rms_std": 0.03949632868170738,
+          "adjacent_correlation": 0.6378588080406189
+        }
+      },
+      "sparse-tail-d768": {
+        "weight": {
+          "rms": 1.0018224716186523,
+          "peak_over_rms": 29.00963020324707,
+          "kurtosis": 49.75947570800781,
+          "channel_log2_rms_std": 0.21634487807750702,
+          "adjacent_correlation": -0.00044751266250386834
+        },
+        "activation": {
+          "rms": 1.0018731355667114,
+          "peak_over_rms": 27.32381820678711,
+          "kurtosis": 55.53959274291992,
+          "channel_log2_rms_std": 0.16207312047481537,
+          "adjacent_correlation": -0.0008564466843381524
+        }
+      },
+      "public-like-d1024": {
+        "weight": {
+          "rms": 1.0001920461654663,
+          "peak_over_rms": 38.05519104003906,
+          "kurtosis": 16.739543914794922,
+          "channel_log2_rms_std": 0.3905639350414276,
+          "adjacent_correlation": 0.0006605603848583996
+        },
+        "activation": {
+          "rms": 1.0011069774627686,
+          "peak_over_rms": 54.68946075439453,
+          "kurtosis": 258.15325927734375,
+          "channel_log2_rms_std": 0.6721504926681519,
+          "adjacent_correlation": 0.0015501127345487475
+        }
+      }
+    },
+    "attention": {
+      "gqa-iid-h8-kv2-d128": {
+        "q": {
+          "rms": 1.000276803970337,
+          "peak_over_rms": 6.513822078704834,
+          "kurtosis": 3.5028295516967773,
+          "channel_log2_rms_std": 0.03489672765135765,
+          "adjacent_correlation": -0.00029751763213425875
+        },
+        "k": {
+          "rms": 1.0002281665802002,
+          "peak_over_rms": 5.295666694641113,
+          "kurtosis": 3.4960317611694336,
+          "channel_log2_rms_std": 0.033597055822610855,
+          "adjacent_correlation": 0.0008294580620713532
+        },
+        "v": {
+          "rms": 1.0004594326019287,
+          "peak_over_rms": 5.364722728729248,
+          "kurtosis": 3.478067636489868,
+          "channel_log2_rms_std": 0.030583102256059647,
+          "adjacent_correlation": 0.0013355988776311278
+        }
+      },
+      "gqa-scaled-h16-kv2-d128": {
+        "q": {
+          "rms": 1.0014926195144653,
+          "peak_over_rms": 19.09649658203125,
+          "kurtosis": 14.355467796325684,
+          "channel_log2_rms_std": 1.0146251916885376,
+          "adjacent_correlation": -0.000563486129976809
+        },
+        "k": {
+          "rms": 1.0012483596801758,
+          "peak_over_rms": 15.449463844299316,
+          "kurtosis": 16.114315032958984,
+          "channel_log2_rms_std": 1.0870476961135864,
+          "adjacent_correlation": -5.3587414186040405e-06
+        },
+        "v": {
+          "rms": 1.001024842262268,
+          "peak_over_rms": 8.89713191986084,
+          "kurtosis": 6.073071002960205,
+          "channel_log2_rms_std": 0.5525925755500793,
+          "adjacent_correlation": -0.0033504010643810034
+        }
+      },
+      "mha-tail-h4-d128": {
+        "q": {
+          "rms": 1.0018928050994873,
+          "peak_over_rms": 27.697574615478516,
+          "kurtosis": 54.00910568237305,
+          "channel_log2_rms_std": 0.1559416651725769,
+          "adjacent_correlation": 0.0007507986156269908
+        },
+        "k": {
+          "rms": 1.0015032291412354,
+          "peak_over_rms": 25.836162567138672,
+          "kurtosis": 55.65432357788086,
+          "channel_log2_rms_std": 0.15958060324192047,
+          "adjacent_correlation": -0.0018146143993362784
+        },
+        "v": {
+          "rms": 1.0014697313308716,
+          "peak_over_rms": 30.143198013305664,
+          "kurtosis": 55.12853240966797,
+          "channel_log2_rms_std": 0.16103096306324005,
+          "adjacent_correlation": 0.00022947268735151738
+        }
+      },
+      "mqa-correlated-h8-d256": {
+        "q": {
+          "rms": 1.2010040283203125,
+          "peak_over_rms": 6.557013988494873,
+          "kurtosis": 3.5134952068328857,
+          "channel_log2_rms_std": 0.04742910712957382,
+          "adjacent_correlation": 0.6255912780761719
+        },
+        "k": {
+          "rms": 1.200830340385437,
+          "peak_over_rms": 5.308826446533203,
+          "kurtosis": 3.591059446334839,
+          "channel_log2_rms_std": 0.04688924178481102,
+          "adjacent_correlation": 0.6292708516120911
+        },
+        "v": {
+          "rms": 1.0002332925796509,
+          "peak_over_rms": 5.647119998931885,
+          "kurtosis": 3.5451440811157227,
+          "channel_log2_rms_std": 0.06817608326673508,
+          "adjacent_correlation": 0.6280941963195801
+        }
+      }
+    }
+  }
+}

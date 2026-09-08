@@ -1,0 +1,278 @@
+{
+  "schema": 1,
+  "description": "Fixed-seed random trend set. Public and Qwen tensors are optional guards and never participate in the fitted trend score.",
+  "attention_robust_seeds": [],
+  "linear_robust_seeds": [],
+  "sources": {
+    "random_exam": "random_exam_dataset.py / random_trend_data/*.pt",
+    "random_robust": "robust_*_benchmark.py fixed seeds",
+    "optional_public_guard": "../organizer_sparse/data/{attn,linear}.pt",
+    "optional_qwen_guard": "real_model_data/qwen2_5_0_5b.pt"
+  },
+  "online_results": [
+    {
+      "revision": "d75e03a",
+      "score": 15300,
+      "seconds": 261,
+      "status": "measured"
+    },
+    {
+      "revision": "5b922c8",
+      "score": 15600,
+      "seconds": 248,
+      "status": "measured"
+    },
+    {
+      "revision": "a649209",
+      "score": 16000,
+      "seconds": 243,
+      "status": "measured"
+    },
+    {
+      "revision": "237b142",
+      "score": null,
+      "seconds": 300,
+      "status": "timeout"
+    },
+    {
+      "revision": "b7248c6",
+      "score": 16000,
+      "seconds": null,
+      "status": "measured"
+    },
+    {
+      "revision": "def4524",
+      "score": 16775,
+      "seconds": 242,
+      "status": "measured"
+    },
+    {
+      "revision": "097c2e5",
+      "score": 16775,
+      "seconds": 242,
+      "status": "measured"
+    },
+    {
+      "revision": "e0a19b0",
+      "score": 16700,
+      "seconds": 250,
+      "status": "measured"
+    },
+    {
+      "revision": "3c40705",
+      "score": 16991,
+      "seconds": 250,
+      "status": "measured"
+    },
+    {
+      "revision": "988385e",
+      "score": 17440,
+      "seconds": 252,
+      "status": "measured"
+    },
+    {
+      "revision": "be6ffae",
+      "score": 17508,
+      "seconds": 254,
+      "status": "measured"
+    },
+    {
+      "revision": "fe4b879",
+      "score": 17675,
+      "seconds": null,
+      "status": "measured"
+    },
+    {
+      "revision": "768a670",
+      "score": 18178,
+      "seconds": 233,
+      "status": "measured"
+    },
+    {
+      "revision": "8d88fbc",
+      "score": 18182,
+      "seconds": 230,
+      "status": "measured"
+    },
+    {
+      "revision": "3e93bd2",
+      "score": 18417,
+      "seconds": 232,
+      "status": "measured"
+    }
+  ],
+  "case_counts": {
+    "attn_random": 4,
+    "linear_random": 5,
+    "optional_attn_public_guard": 1,
+    "optional_linear_public_guard": 1,
+    "optional_attn_qwen_guard": 3,
+    "optional_linear_qwen_guard": 3
+  },
+  "metrics": {
+    "d75e03a": {
+      "linear_random": -0.08209349501270258,
+      "attn_random_full": 0.18213773388223525,
+      "attn_random_causal": 0.14062223116345407,
+      "attn_random": 0.16137998252284466
+    },
+    "5b922c8": {
+      "linear_random": -0.007630850473802764,
+      "attn_random_full": 0.18577857710980772,
+      "attn_random_causal": 0.1376240389872251,
+      "attn_random": 0.1617013080485164
+    },
+    "a649209": {
+      "linear_random": -0.0538271253977685,
+      "attn_random_full": 0.18577857710980772,
+      "attn_random_causal": 0.1376240389872251,
+      "attn_random": 0.1617013080485164
+    },
+    "def4524": {
+      "linear_random": -0.022078243819916833,
+      "attn_random_full": 0.19575092621634735,
+      "attn_random_causal": 0.15434821041150062,
+      "attn_random": 0.175049568313924
+    },
+    "3c40705": {
+      "linear_random": -0.022078243819916833,
+      "attn_random_full": 0.20054892846024294,
+      "attn_random_causal": 0.15668113996973665,
+      "attn_random": 0.1786150342149898
+    },
+    "988385e": {
+      "linear_random": -0.022078243819916833,
+      "attn_random_full": 0.2301959990522145,
+      "attn_random_causal": 0.18446526414028241,
+      "attn_random": 0.20733063159624845
+    },
+    "be6ffae": {
+      "linear_random": 0.00933132667856027,
+      "attn_random_full": 0.2301959990522145,
+      "attn_random_causal": 0.18446526414028241,
+      "attn_random": 0.20733063159624845
+    },
+    "fe4b879": {
+      "linear_random": 0.00933132667856027,
+      "attn_random_full": 0.2434680257443922,
+      "attn_random_causal": 0.19334571688123284,
+      "attn_random": 0.2184068713128125
+    },
+    "768a670": {
+      "linear_random": 0.00933132667856027,
+      "attn_random_full": 0.24684131658894287,
+      "attn_random_causal": 0.1999134008385307,
+      "attn_random": 0.2233773587137368
+    },
+    "8d88fbc": {
+      "linear_random": 0.00933132667856027,
+      "attn_random_full": 0.25515927970661545,
+      "attn_random_causal": 0.20462501447504558,
+      "attn_random": 0.2298921470908305
+    },
+    "3e93bd2": {
+      "linear_random": 0.10034889034038068,
+      "attn_random_full": 0.25515927970661545,
+      "attn_random_causal": 0.20462501447504558,
+      "attn_random": 0.2298921470908305
+    }
+  },
+  "calibration": {
+    "revisions": [
+      "d75e03a",
+      "5b922c8",
+      "a649209",
+      "def4524",
+      "3c40705",
+      "988385e",
+      "be6ffae",
+      "fe4b879",
+      "768a670",
+      "8d88fbc",
+      "3e93bd2"
+    ],
+    "source_order": [
+      "attn_random",
+      "linear_random"
+    ],
+    "weights": [
+      0.6000227869947852,
+      0.39997721300521494
+    ],
+    "feature_mean": [
+      0.19587972623177255,
+      -0.006555636844491145
+    ],
+    "feature_scale": [
+      0.027132761134588127,
+      0.04379988800891119
+    ],
+    "online_scores": [
+      15300.0,
+      15600.0,
+      16000.0,
+      16775.0,
+      16991.0,
+      17440.0,
+      17508.0,
+      17675.0,
+      18178.0,
+      18182.0,
+      18417.0
+    ],
+    "predicted_z": [
+      -1.4527445767997733,
+      -0.7656515282240783,
+      -1.187512362469847,
+      -0.6023962050130363,
+      -0.5235483215897311,
+      0.11147782578450727,
+      0.3983076109911657,
+      0.6432512122409091,
+      0.7531702023588431,
+      0.8972403712338377,
+      1.7284057714872123
+    ],
+    "score_intercept": 17096.909090909092,
+    "score_slope": 1027.1923967359048,
+    "predicted_scores": [
+      15604.660907221045,
+      16310.437662568092,
+      15877.105421150172,
+      16478.132289297137,
+      16559.124235648276,
+      17211.418265959586,
+      17506.047640481258,
+      17757.651845314107,
+      17870.55979622014,
+      18018.54757828499,
+      18872.31435785521
+    ],
+    "mean_absolute_score_error": 282.37541326517254,
+    "rank_correlation": 0.990909090909091,
+    "pairwise_accuracy": 0.9818181818181818,
+    "normalized_rmse": 0.3330280586197911
+  },
+  "candidate_scores": {
+    "3e93bd2": {
+      "metrics": {
+        "linear_random": 0.10034889034038068,
+        "attn_random_full": 0.25515927970661545,
+        "attn_random_causal": 0.20462501447504558,
+        "attn_random": 0.2298921470908305
+      },
+      "trend_z": 1.7284057714872123,
+      "illustrative_predicted_score": 18872.31435785521
+    },
+    "worktree": {
+      "metrics": {
+        "linear_random": 0.10034889034038068,
+        "attn_random_full": 0.25570646848835954,
+        "attn_random_causal": 0.2084609836623698,
+        "attn_random": 0.23208372607536465
+      },
+      "trend_z": 1.7768710686125777,
+      "illustrative_predicted_score": 18922.097542567935
+    }
+  }
+}

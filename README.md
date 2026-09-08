@@ -19,6 +19,10 @@ legal HiF4 parameters for Linear and Attention workloads.
   distribution families, public data, and captured real-model data.
 - `robust_attention_benchmark.py`: covers MHA/GQA/MQA, head dimensions
   64/128/256, short/long sequences, tails, and Q/K imbalance.
+- `random_exam_dataset.py`: materializes a deterministic random exam-like
+  dataset with IID, scaled, correlated and sparse-heavy-tail families.
+- `online_trend_dataset.py`: replays historical revisions on that random set
+  and calibrates a two-component Attention/Linear trend score.
 - `attention_component_ablation.py`: isolates Q-only and K-only Hessian gains.
 - `attention_k_sweep.py`: measures K-Hessian rank, sweep, guard, and token caps.
 
