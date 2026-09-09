@@ -90,9 +90,13 @@ _HESSIAN_LOW_RANK_SWEEPS = 1
 # quantized activation compensate for the already-quantized Weight.  The
 # strength was selected on generic distribution families; the public and
 # captured-model tensors are confirmation sets only.
-_LINEAR_JOINT_STRENGTH = 0.21875
+_LINEAR_JOINT_STRENGTH = 0.25
+_LINEAR_JOINT_SWEEPS = 4
 _LINEAR_JOINT_MIN_IMPROVEMENT = 0.001
 _LINEAR_JOINT_PLAIN_MSE_CAP = 0.15
+_LINEAR_PRECONDITION_RIDGE = 0.001
+_LINEAR_PRECONDITION_SWEEPS = 1
+_LINEAR_PRECONDITION_EXTRA_LANES = 16
 
 
 # =============================================================================
@@ -1624,10 +1628,30 @@ def _linear_joint_statistics(
     )
 
 
-def _refine_linear_activation_joint(
+def _prepare_linear_joint_matrices(
+    gram: torch.Tensor,
+    cross: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply the conservative off-diagonal coupling used online."""
+
+    diagonal = torch.diagonal(gram, dim1=-2, dim2=-1)
+    diagonal_matrix = torch.diag_embed(diagonal)
+    strength = _LINEAR_JOINT_STRENGTH
+    gram = diagonal_matrix + strength * (gram - diagonal_matrix)
+    cross_diagonal = torch.diagonal(cross, dim1=-2, dim2=-1)
+    cross = diagonal_matrix + strength * (cross - diagonal_matrix)
+    torch.diagonal(cross, dim1=-2, dim2=-1).copy_(
+        diagonal + strength * (cross_diagonal - diagonal)
+    )
+    return gram, cross
+
+
+def _refine_linear_activation_joint_once(
     values: torch.Tensor,
     params: dict[str, torch.Tensor],
     state: Any,
+    sweep_rounds: int,
+    extra_lanes: int = 0,
 ) -> dict[str, torch.Tensor]:
     """Refine fixed-scale activation codes under an asymmetric W/What loss."""
 
@@ -1648,15 +1672,7 @@ def _refine_linear_activation_joint(
         "joint_cross",
         (blocks, _HIF4_BLOCK_SIZE, _HIF4_BLOCK_SIZE),
     )
-    diagonal = torch.diagonal(gram, dim1=-2, dim2=-1)
-    diagonal_matrix = torch.diag_embed(diagonal)
-    strength = _LINEAR_JOINT_STRENGTH
-    gram = diagonal_matrix + strength * (gram - diagonal_matrix)
-    cross_diagonal = torch.diagonal(cross, dim1=-2, dim2=-1)
-    cross = diagonal_matrix + strength * (cross - diagonal_matrix)
-    torch.diagonal(cross, dim1=-2, dim2=-1).copy_(
-        diagonal + strength * (cross_diagonal - diagonal)
-    )
+    gram, cross = _prepare_linear_joint_matrices(gram, cross)
 
     step = (
         params["scale_factor"].float()
@@ -1669,7 +1685,9 @@ def _refine_linear_activation_joint(
     gradient = torch.einsum("bij,nbj->nbi", cross, source)
     gradient -= torch.einsum("bij,nbj->nbi", gram, quantized)
     objective_change = torch.zeros_like(old_plain)
-    for lane in range(_HIF4_BLOCK_SIZE):
+    coordinate_updates = sweep_rounds * _HIF4_BLOCK_SIZE + extra_lanes
+    for coordinate in range(coordinate_updates):
+        lane = coordinate % _HIF4_BLOCK_SIZE
         curvature = gram[:, lane, lane].clamp_min(1.0e-12)
         target = (
             quantized[:, :, lane]
@@ -1720,6 +1738,89 @@ def _refine_linear_activation_joint(
     output = dict(params)
     output["sign"] = codes.sign().contiguous()
     output["mant"] = (codes.abs() * 0.25).contiguous()
+    return output
+
+
+def _refine_linear_activation_joint(
+    values: torch.Tensor,
+    params: dict[str, torch.Tensor],
+    state: Any,
+) -> dict[str, torch.Tensor]:
+    """Search both the incumbent scale basin and a Weight-compensated basin."""
+
+    incumbent = _refine_linear_activation_joint_once(
+        values,
+        params,
+        state,
+        _LINEAR_JOINT_SWEEPS,
+    )
+    channels = int(values.shape[-1])
+    rows = values.numel() // channels
+    blocks = channels // _HIF4_BLOCK_SIZE
+    source = values.reshape(rows, blocks, _HIF4_BLOCK_SIZE)
+    gram = _state_tensor(
+        state,
+        "joint_gram",
+        (blocks, _HIF4_BLOCK_SIZE, _HIF4_BLOCK_SIZE),
+    )
+    cross = _state_tensor(
+        state,
+        "joint_cross",
+        (blocks, _HIF4_BLOCK_SIZE, _HIF4_BLOCK_SIZE),
+    )
+    gram, cross = _prepare_linear_joint_matrices(gram, cross)
+    transfer = _state_tensor(
+        state,
+        "joint_transfer",
+        (blocks, _HIF4_BLOCK_SIZE, _HIF4_BLOCK_SIZE),
+    )
+    target = torch.einsum("bij,nbj->nbi", transfer, source)
+    alternate = _quantize_hif4(
+        target.reshape_as(values),
+        torch.diagonal(gram, dim1=-2, dim2=-1).reshape(-1),
+    )
+    alternate = _refine_linear_activation_joint_once(
+        values,
+        alternate,
+        state,
+        _LINEAR_PRECONDITION_SWEEPS,
+        _LINEAR_PRECONDITION_EXTRA_LANES,
+    )
+
+    incumbent_value = _reconstruct_hif4_fp32(
+        incumbent, tuple(values.shape)
+    ).reshape_as(source)
+    alternate_value = _reconstruct_hif4_fp32(
+        alternate, tuple(values.shape)
+    ).reshape_as(source)
+    projected_source = torch.einsum("bij,nbj->nbi", cross, source)
+
+    def objective(candidate: torch.Tensor) -> torch.Tensor:
+        return (
+            torch.einsum("nbi,bij,nbj->nb", candidate, gram, candidate)
+            - 2.0 * (candidate * projected_source).sum(dim=-1)
+        ).sum(dim=-1)
+
+    incumbent_objective = objective(incumbent_value)
+    alternate_objective = objective(alternate_value)
+    incumbent_plain = (source - incumbent_value).square().sum(dim=(1, 2))
+    alternate_plain = (source - alternate_value).square().sum(dim=(1, 2))
+    use_alternate = alternate_objective < incumbent_objective
+    use_alternate &= alternate_plain <= incumbent_plain * (
+        1.0 + _LINEAR_JOINT_PLAIN_MSE_CAP
+    )
+
+    prefix_dims = values.ndim - 1
+    output = {}
+    for name, baseline in incumbent.items():
+        tail = tuple(baseline.shape[prefix_dims:])
+        condition = use_alternate.reshape(rows, *([1] * len(tail)))
+        selected = torch.where(
+            condition,
+            alternate[name].reshape(rows, *tail),
+            baseline.reshape(rows, *tail),
+        )
+        output[name] = selected.reshape_as(baseline).contiguous()
     return output
 
 
@@ -1903,14 +2004,28 @@ def hif4_calibration_and_quantize_weight(
     joint_gram, joint_cross = _linear_joint_statistics(
         transformed_weight, weight_params
     )
+    prepared_gram, prepared_cross = _prepare_linear_joint_matrices(
+        joint_gram, joint_cross
+    )
+    joint_diagonal = torch.diagonal(
+        prepared_gram, dim1=-2, dim2=-1
+    ).mean(dim=-1).clamp_min(1.0e-8)
+    joint_transfer = torch.linalg.solve(
+        prepared_gram
+        + _LINEAR_PRECONDITION_RIDGE
+        * joint_diagonal[:, None, None]
+        * torch.eye(_HIF4_BLOCK_SIZE, dtype=torch.float32)[None],
+        prepared_cross,
+    ).cpu().contiguous()
     state = _make_state("activation")
     state.update({
-        "schema_version": 9,
-        "algorithm": "hif4-token-guarded-asymmetric-linear-reconstruction",
+        "schema_version": 10,
+        "algorithm": "hif4-weight-preconditioned-linear-reconstruction",
         "smooth_scale": smooth.detach().cpu().contiguous(),
         "error_weights": activation_importance.detach().cpu().contiguous(),
         "joint_gram": joint_gram,
         "joint_cross": joint_cross,
+        "joint_transfer": joint_transfer,
         "joint_strength": _LINEAR_JOINT_STRENGTH,
         "smooth_alpha": _LINEAR_SMOOTH_ALPHA,
         "rotation": "signed-hadamard-64",
@@ -2543,8 +2658,8 @@ _V_TOKEN_UPDATES = 4
 # length schedule keeps the long-sequence work conservative while retaining
 # the stronger prior on short sequences.
 _V_PREFIX_MAX_BLEND = 0.2
-_V_PREFIX_LENGTH_SCALE = 3.2
-_V_PREFIX_UPDATES = 2
+_V_PREFIX_LENGTH_SCALE = 6.4
+_V_PREFIX_UPDATES = 1
 # Test-time quotient selection supersedes the slower calibration-time K guard.
 # The final wrapper below still attaches both nested V coupling coefficients.
 _V_EXCHANGE_CALIBRATION = _K_BASE_CALIBRATION
