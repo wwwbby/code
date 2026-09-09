@@ -2538,6 +2538,13 @@ def hif4_dynamic_quantize_k(k_quant, k_scale, kv_num_heads, head_dim, k_state):
 _V_TOKEN_GROUP = 16
 _V_TOKEN_COUPLING = 1.0
 _V_TOKEN_UPDATES = 4
+# A small, distribution-free blend toward the expected output error of an
+# equal mixture of full attention and uniform causal attention.  The inverse
+# length schedule keeps the long-sequence work conservative while retaining
+# the stronger prior on short sequences.
+_V_PREFIX_MAX_BLEND = 0.025
+_V_PREFIX_LENGTH_SCALE = 3.2
+_V_PREFIX_UPDATES = 2
 # Test-time quotient selection supersedes the slower calibration-time K guard.
 # The final wrapper below still attaches both nested V coupling coefficients.
 _V_EXCHANGE_CALIBRATION = _K_BASE_CALIBRATION
@@ -2630,6 +2637,100 @@ def _v_exchange_round(v, params, beta4, beta8, beta16):
     return result
 
 
+def _v_prefix_round(v, params, beta4, beta8, beta16):
+    """Append two fixed-scale updates for analytic full/causal prefix error."""
+    group = _V_TOKEN_GROUP
+    length, width = v.shape
+    padding = (-length) % group
+    step = (
+        (
+            params['scale_factor'].float()
+            * params['scale_lv2'].float()
+            * params['scale_lv3'].float()
+        )
+        / 4
+    ).expand_as(params['mant']).reshape(v.shape)
+    source = torch.nn.functional.pad(
+        v, (0, 0, 0, padding)
+    ).reshape(-1, group, width)
+    steps = torch.nn.functional.pad(
+        step, (0, 0, 0, padding), value=1.0
+    ).reshape_as(source)
+    quant = torch.nn.functional.pad(
+        _k_reconstruct(params, v.shape), (0, 0, 0, padding)
+    ).reshape_as(source)
+    codes = (quant / steps).round().clamp(-7, 7)
+    error = quant - source
+    valid = (
+        torch.arange(length + padding, device=v.device) < length
+    ).reshape(-1, group, 1)
+
+    blend = min(_V_PREFIX_MAX_BLEND, _V_PREFIX_LENGTH_SCALE / max(length, 1))
+    hierarchy_diagonal = 1.0 + beta4 + beta8 + beta16
+    position = torch.arange(
+        1, length + 1, dtype=torch.float32, device=v.device
+    )
+    inverse_square = position.square().reciprocal()
+    causal_diagonal = torch.flip(
+        torch.cumsum(torch.flip(inverse_square, (0,)), 0), (0,)
+    )
+    normalizer = 2.0 * length / (
+        1.0 + float((inverse_square * position).sum())
+    )
+    uniform_diagonal = normalizer * 0.5 * (
+        1.0 / length + causal_diagonal
+    )
+    hessian_diagonal = (
+        (1.0 - blend) + blend * uniform_diagonal[:, None]
+    )
+
+    for _ in range(_V_PREFIX_UPDATES):
+        total16 = error.sum(1, keepdim=True).expand_as(error)
+        total8 = error.reshape(-1, 2, 8, width).sum(2, keepdim=True)
+        total8 = total8.expand(-1, -1, 8, -1).reshape_as(error)
+        total4 = error.reshape(-1, 4, 4, width).sum(2, keepdim=True)
+        total4 = total4.expand(-1, -1, 4, -1).reshape_as(error)
+        hierarchy_gradient = (
+            error + beta4 * total4 + beta8 * total8 + beta16 * total16
+        ) / hierarchy_diagonal
+
+        flat_error = error.reshape(-1, width)[:length]
+        prefix_error = flat_error.cumsum(0)
+        causal_gradient = torch.flip(
+            torch.cumsum(
+                torch.flip(prefix_error * inverse_square[:, None], (0,)), 0
+            ),
+            (0,),
+        )
+        full_gradient = prefix_error[-1:] / length
+        uniform_gradient = normalizer * 0.5 * (
+            full_gradient + causal_gradient
+        )
+
+        gradient = (1.0 - blend) * hierarchy_gradient
+        flat_gradient = gradient.reshape(-1, width)
+        flat_gradient[:length] += blend * uniform_gradient
+        direction = -gradient.sign()
+        delta = steps * direction
+        cost = 2 * gradient * delta
+        flat_cost = cost.reshape(-1, width)
+        flat_cost[:length] += (
+            hessian_diagonal * delta.reshape(-1, width)[:length].square()
+        )
+        allowed = valid & (codes + direction >= -7) & (codes + direction <= 7)
+        cost = cost.masked_fill(~allowed, float('inf'))
+        best, index = cost.min(1, keepdim=True)
+        improve = best < 0
+        error.scatter_add_(1, index, delta.gather(1, index) * improve)
+        codes.scatter_add_(1, index, direction.gather(1, index) * improve)
+
+    codes = codes.reshape(-1, width)[:length].reshape_as(params['mant'])
+    result = dict(params)
+    result['sign'] = codes.sign()
+    result['mant'] = codes.abs() / 4
+    return result
+
+
 def hif4_calibration_attention(calib_qkv_list, q_num_heads, kv_num_heads, head_dim):
     state = _V_EXCHANGE_CALIBRATION(calib_qkv_list, q_num_heads, kv_num_heads, head_dim)
     beta4, beta8, beta16 = _v_exchange_coefficient(
@@ -2638,7 +2739,7 @@ def hif4_calibration_attention(calib_qkv_list, q_num_heads, kv_num_heads, head_d
     state['v_state']['token_coupling4'] = beta4
     state['v_state']['token_coupling8'] = beta8
     state['v_state']['token_coupling16'] = beta16
-    state['v_state']['algorithm'] = 'hif4-v-nested4-8-16-output-error'
+    state['v_state']['algorithm'] = 'hif4-v-nested4-8-16-analytic-prefix-error'
     return state
 
 
@@ -2658,7 +2759,8 @@ def hif4_dynamic_quantize_v(v_quant, v_scale, kv_num_heads, head_dim, v_state):
     beta8 = beta8[:, None].expand(kv_num_heads, head_dim).reshape(1, 1, -1)
     beta16 = beta16[:, None].expand(kv_num_heads, head_dim).reshape(1, 1, -1)
     v = _dequantize_nvfp4_fp32(v_quant, v_scale)
-    return _v_exchange_round(v, params, beta4, beta8, beta16)
+    params = _v_exchange_round(v, params, beta4, beta8, beta16)
+    return _v_prefix_round(v, params, beta4, beta8, beta16)
 
 
 def _w_covariance_reliability(transformed_activations,hessian_reg):
@@ -2744,3 +2846,312 @@ def _w_tail_round(values,params,diagonal,factors,strength):
     code=(optimized/step).round().clamp(-7,7).reshape_as(params['mant'])
     output=dict(params);output['sign']=code.sign().contiguous();output['mant']=(code.abs()/4).contiguous()
     return output
+
+
+# Calibration-time safety selectors.  The richer paths are valuable on
+# heterogeneous/correlated tensors but can lose to the direct converter on
+# nearly isotropic or exceptionally sparse random tensors.  A small held-in
+# calibration projection chooses between those two complete algorithms.  It
+# never inspects a test tensor, model identity, or dataset-specific constant.
+_LINEAR_SELECTOR_SAMPLES = 3
+_LINEAR_SELECTOR_TOKENS = 16
+_LINEAR_SELECTOR_OUTPUT_ROWS = 128
+_LINEAR_SELECTOR_MIN_IMPROVEMENT = 0.02
+_QK_SELECTOR_SAMPLES = 3
+_QK_SELECTOR_TOKENS = 64
+_QK_SELECTOR_MIN_IMPROVEMENT = 0.05
+
+
+def _selector_positions(length, count, device):
+    return torch.linspace(
+        0,
+        max(length - 1, 0),
+        min(length, count),
+        dtype=torch.float32,
+        device=device,
+    ).round().to(torch.int64)
+
+
+def _selector_accept(
+    candidate_loss,
+    direct_loss,
+    min_improvement,
+    require_folds=True,
+):
+    """Require a mean win, optionally confirmed by alternating folds."""
+
+    candidate = torch.stack(candidate_loss)
+    direct = torch.stack(direct_loss)
+    use_candidate = bool(
+        candidate.mean() < direct.mean() * (1.0 - min_improvement)
+    )
+    if require_folds:
+        for candidate_fold, direct_fold in (
+            (candidate[::2], direct[::2]),
+            (candidate[1::2], direct[1::2]),
+        ):
+            if candidate_fold.numel():
+                use_candidate &= bool(candidate_fold.mean() <= direct_fold.mean())
+    return use_candidate, torch.stack((candidate, direct), dim=-1)
+
+
+_SELECTOR_LINEAR_CALIBRATION = hif4_calibration_and_quantize_weight
+_SELECTOR_LINEAR_DYNAMIC = hif4_dynamic_quantize_activation
+
+
+def hif4_calibration_and_quantize_weight(
+    weight_quant,
+    weight_scale,
+    calib_activation_list,
+):
+    """Select the correlated Linear path only when calibration supports it."""
+
+    calibrated = _SELECTOR_LINEAR_CALIBRATION(
+        weight_quant, weight_scale, calib_activation_list
+    )
+    weight = dequantize_nvfp4(weight_quant, weight_scale).float()
+    output_positions = _selector_positions(
+        int(weight.shape[0]),
+        _LINEAR_SELECTOR_OUTPUT_ROWS,
+        weight.device,
+    )
+    sampled_weight = weight[output_positions]
+    candidate_weight = _reconstruct_hif4_fp32(
+        {
+            name: value[output_positions]
+            for name, value in calibrated['weight_params'].items()
+        },
+        tuple(sampled_weight.shape),
+    )
+    direct_weight = _reconstruct_hif4_fp32(
+        _quantize_hif4_fast(sampled_weight), tuple(sampled_weight.shape)
+    )
+
+    sample_positions = _selector_positions(
+        len(calib_activation_list),
+        _LINEAR_SELECTOR_SAMPLES,
+        weight.device,
+    ).tolist()
+    candidate_loss = []
+    direct_loss = []
+    for sample_index in sample_positions:
+        quant, scale = calib_activation_list[sample_index]
+        token_positions = _selector_positions(
+            int(quant.shape[0]), _LINEAR_SELECTOR_TOKENS, quant.device
+        )
+        selected_quant = quant[token_positions]
+        selected_scale = scale[token_positions]
+        activation = dequantize_nvfp4(
+            selected_quant, selected_scale
+        ).float()
+        candidate_activation = _reconstruct_hif4_fp32(
+            _SELECTOR_LINEAR_DYNAMIC(
+                selected_quant,
+                selected_scale,
+                calibrated['activation_state'],
+            ),
+            tuple(activation.shape),
+        )
+        direct_activation = _reconstruct_hif4_fp32(
+            _quantize_hif4_fast(activation), tuple(activation.shape)
+        )
+        # Evaluate the two output residuals directly.  This expansion is
+        # algebraically Ah@Wh.T - A@W.T, but it never materializes the
+        # prohibited calibration output target A@W.T.
+        candidate_error = (
+            (candidate_activation - activation) @ candidate_weight.T
+            + activation @ (candidate_weight - sampled_weight).T
+        )
+        direct_error = (
+            (direct_activation - activation) @ direct_weight.T
+            + activation @ (direct_weight - sampled_weight).T
+        )
+        candidate_loss.append(candidate_error.square().mean().cpu())
+        direct_loss.append(direct_error.square().mean().cpu())
+
+    use_candidate, selector_loss = _selector_accept(
+        candidate_loss,
+        direct_loss,
+        _LINEAR_SELECTOR_MIN_IMPROVEMENT,
+    )
+    calibrated['activation_state']['use_correlated_path'] = torch.tensor(
+        use_candidate, dtype=torch.bool
+    )
+    calibrated['activation_state']['selector_loss'] = selector_loss.contiguous()
+    calibrated['activation_state']['algorithm'] = (
+        'hif4-calibration-guarded-linear'
+    )
+    if not use_candidate:
+        calibrated['weight_params'] = _quantize_hif4_fast(weight)
+    return calibrated
+
+
+def hif4_dynamic_quantize_activation(
+    activation_quant,
+    activation_scale,
+    activation_state,
+):
+    if bool(activation_state.get('use_correlated_path', True)):
+        return _SELECTOR_LINEAR_DYNAMIC(
+            activation_quant, activation_scale, activation_state
+        )
+    activation = dequantize_nvfp4(
+        activation_quant, activation_scale
+    ).float()
+    return _quantize_hif4_fast(activation)
+
+
+_SELECTOR_ATTENTION_CALIBRATION = hif4_calibration_attention
+_SELECTOR_Q_DYNAMIC = hif4_dynamic_quantize_q
+_SELECTOR_K_DYNAMIC = hif4_dynamic_quantize_k
+
+
+def _selector_attention(q, k, v, q_heads, kv_heads, head_dim, causal):
+    length = int(q.shape[0])
+    query = q.reshape(length, q_heads, head_dim).transpose(0, 1)
+    key = k.reshape(length, kv_heads, head_dim).transpose(0, 1)
+    value = v.reshape(length, kv_heads, head_dim).transpose(0, 1)
+    repeats = q_heads // kv_heads
+    key = key.repeat_interleave(repeats, dim=0)
+    value = value.repeat_interleave(repeats, dim=0)
+    logits = query @ key.transpose(-1, -2) / (float(head_dim) ** 0.5)
+    if causal:
+        mask = torch.ones(
+            length, length, dtype=torch.bool, device=logits.device
+        ).triu(1)
+        logits = logits.masked_fill(mask, float('-inf'))
+    return logits.softmax(dim=-1) @ value
+
+
+def hif4_calibration_attention(
+    calib_qkv_list,
+    q_num_heads,
+    kv_num_heads,
+    head_dim,
+):
+    """Guard the paired Q/K transform with end-to-end calibration output."""
+
+    states = _SELECTOR_ATTENTION_CALIBRATION(
+        calib_qkv_list, q_num_heads, kv_num_heads, head_dim
+    )
+    sample_positions = _selector_positions(
+        len(calib_qkv_list), _QK_SELECTOR_SAMPLES, torch.device('cpu')
+    ).tolist()
+    candidate_loss = []
+    direct_loss = []
+    for sample_index in sample_positions:
+        sample = calib_qkv_list[sample_index]
+        length = int(sample['q'][0].shape[0])
+        token_positions = _selector_positions(
+            length, _QK_SELECTOR_TOKENS, sample['q'][0].device
+        )
+        pairs = {
+            name: (
+                sample[name][0][token_positions],
+                sample[name][1][token_positions],
+            )
+            for name in ('q', 'k', 'v')
+        }
+        original = {
+            name: _dequantize_nvfp4_fp32(*pair)
+            for name, pair in pairs.items()
+        }
+        candidate_q = _reconstruct_hif4_fp32(
+            _SELECTOR_Q_DYNAMIC(
+                *pairs['q'], q_num_heads, head_dim, states['q_state']
+            ),
+            tuple(original['q'].shape),
+        )
+        candidate_k = _reconstruct_hif4_fp32(
+            _SELECTOR_K_DYNAMIC(
+                *pairs['k'], kv_num_heads, head_dim, states['k_state']
+            ),
+            tuple(original['k'].shape),
+        )
+        direct_q = _reconstruct_hif4_fp32(
+            _quantize_hif4(original['q']), tuple(original['q'].shape)
+        )
+        direct_k = _reconstruct_hif4_fp32(
+            _quantize_hif4(original['k']), tuple(original['k'].shape)
+        )
+        candidate_error = torch.zeros((), dtype=torch.float32)
+        direct_error = torch.zeros((), dtype=torch.float32)
+        for causal in (False, True):
+            reference = _selector_attention(
+                original['q'],
+                original['k'],
+                original['v'],
+                q_num_heads,
+                kv_num_heads,
+                head_dim,
+                causal,
+            )
+            candidate_output = _selector_attention(
+                candidate_q,
+                candidate_k,
+                original['v'],
+                q_num_heads,
+                kv_num_heads,
+                head_dim,
+                causal,
+            )
+            direct_output = _selector_attention(
+                direct_q,
+                direct_k,
+                original['v'],
+                q_num_heads,
+                kv_num_heads,
+                head_dim,
+                causal,
+            )
+            candidate_error += (candidate_output - reference).square().mean()
+            direct_error += (direct_output - reference).square().mean()
+        candidate_loss.append(candidate_error.cpu())
+        direct_loss.append(direct_error.cpu())
+
+    use_candidate, selector_loss = _selector_accept(
+        candidate_loss,
+        direct_loss,
+        _QK_SELECTOR_MIN_IMPROVEMENT,
+        # Calibration items intentionally use different sequence lengths, so
+        # alternating folds are not identically distributed.  The aggregate
+        # five-percent margin is the more stable Q/K guard.
+        require_folds=False,
+    )
+    flag = torch.tensor(use_candidate, dtype=torch.bool)
+    states['q_state']['use_transformed_qk'] = flag
+    states['k_state']['use_transformed_qk'] = flag.clone()
+    states['q_state']['qk_selector_loss'] = selector_loss.contiguous()
+    states['q_state']['algorithm'] = 'hif4-calibration-guarded-qk'
+    states['k_state']['algorithm'] = 'hif4-calibration-guarded-qk'
+    return states
+
+
+def hif4_dynamic_quantize_q(
+    q_quant,
+    q_scale,
+    q_num_heads,
+    head_dim,
+    q_state,
+):
+    if bool(q_state.get('use_transformed_qk', True)):
+        return _SELECTOR_Q_DYNAMIC(
+            q_quant, q_scale, q_num_heads, head_dim, q_state
+        )
+    q = _dequantize_nvfp4_fp32(q_quant, q_scale)
+    return _quantize_hif4(q)
+
+
+def hif4_dynamic_quantize_k(
+    k_quant,
+    k_scale,
+    kv_num_heads,
+    head_dim,
+    k_state,
+):
+    if bool(k_state.get('use_transformed_qk', True)):
+        return _SELECTOR_K_DYNAMIC(
+            k_quant, k_scale, kv_num_heads, head_dim, k_state
+        )
+    k = _dequantize_nvfp4_fp32(k_quant, k_scale)
+    return _quantize_hif4(k)

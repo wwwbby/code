@@ -141,6 +141,55 @@ current worktree in 19.23 seconds.  Future candidates should first improve the
 random trend score, then pass public/Qwen regression guards and a separate
 runtime gate.  A local gain on Qwen alone is no longer promotion evidence.
 
+### Calibration-guarded direct fallback (local 20000 gate passed)
+
+The random set exposed a distribution-selection failure rather than a need for
+another unconditional Hessian pass.  On `3e93bd2`, Linear scores `-0.0436` on
+the IID family and `-0.5715` on the public-like extreme-tail family, while the
+paired Q/K transform is negative on the correlated Attention family.  The new
+candidate retains the richer algorithms only when small deterministic
+calibration projections support them; otherwise both operands use the refined
+direct converter.
+
+- Linear evaluates three calibration samples, at most 16 tokens and 128
+  output rows.  It requires 2% lower mean residual and agreement on alternating
+  folds.  The output residual is expanded from activation and weight errors;
+  no calibration `A @ W` target is materialized.
+- Q/K evaluates three samples with at most 64 tokens and requires 5% lower
+  aggregate full-plus-causal Attention output error.  A rejected first version
+  also required alternating-fold agreement; that rule incorrectly rejected a
+  strong sparse-tail path on an independent seed because the folds had
+  different sequence lengths.
+- V adds two fixed-scale analytic full/causal prefix updates after the existing
+  nested 4/8/16-token exchange.  In isolation this is only a small signal
+  (`18872 -> 18922`); the calibration guards provide the material gain.
+
+Final random-trend results:
+
+| dataset seed | `3e93bd2` local estimate | candidate local estimate |
+|---|---:|---:|
+| fitted `20260908` | 18872 | **20818** |
+| holdout `20261017` | 18903 | **20784** |
+| holdout `20261129` | 19217 | **20645** |
+
+On the fitted set, Attention moves `0.229892 -> 0.264748` and Linear moves
+`0.100349 -> 0.223376`.  The first holdout moves `0.237097/0.086216 ->
+0.264399/0.220593`; the second moves `0.232304/0.131273 ->
+0.258739/0.219474`.  These point values use the frozen affine trend mapping and
+are not claims about the server result.
+
+The public/Qwen guard matrix remains non-regressive: candidate values are
+Attention `0.37578/0.92816` and Linear `0.82433/0.46044`; the corresponding
+`3e93bd2` values are `0.37382/0.92800` and `0.82433/0.46044`.  Six independent
+Attention structures covering MHA/GQA/MQA and dimensions 64/128/256 improve
+from `0.46334/0.36599` to `0.46373/0.36882` for full/causal means.
+
+Same-process public API timing is `37.288 s` for `3e93bd2` and `38.472 s` for
+the candidate, a 3.17% increase.  Scaling the measured 232-second server
+baseline by that ratio gives an illustrative 239-second runtime, leaving about
+61 seconds below the hard 300-second cutoff.  The output-format checks pass
+`22/22` on the organizer sample and `94/94` on the generated random set.
+
 The user reported `fe4b879` at 17675 points. It confirms a 167-point gain from
 removing the 0.25 damping while leaving the operation count unchanged. Server
 time has not yet been reported. The remaining gap to 20000 is 2325 points.

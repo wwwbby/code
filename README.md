@@ -52,15 +52,26 @@ score K error, factors it once to rank 8, and stores the small factors in
 local sweeps and accepts blocks with at least 10% covariance-loss reduction.
 This K-only design captures the useful part of the timed-out Q+K experiment
 without repeatedly factorizing Hessians or refining the much larger Q tensor.
-V uses a mild, compressed diagonal importance derived from bounded full/causal
-attention statistics and is still quantized only once.
+V starts from a mild, compressed diagonal importance derived from bounded
+full/causal attention statistics. Four nested 4/8/16-token error-exchange
+updates and two inexpensive analytic full/causal prefix updates then adjust
+only legal mantissas while retaining the chosen scale hierarchy.
+
+The final calibration guard compares each richer Linear and paired-Q/K path
+with a direct path on small deterministic projections of the supplied
+calibration tensors; the Q/K direct path retains local scale refinement.
+Linear requires a 2% aggregate improvement plus agreement on alternating
+calibration folds; Q/K requires a 5% end-to-end Attention improvement.
+Otherwise both operands take the direct path, preventing a distribution-
+specific transform from turning a gain into a regression.
 
 The paired Linear and Q/K transforms are algebraically cancelling, so they
 preserve the unquantized Linear output and attention logits exactly apart from
 floating-point roundoff.
 
-The submission code performs no file I/O and never computes the prohibited
-Linear `A @ W` calibration target.
+The submission code performs no file I/O and never materializes the prohibited
+Linear `A @ W` calibration target; the Linear guard evaluates its small output
+residual directly from activation and weight quantization errors.
 
 ## Local results
 
@@ -79,6 +90,12 @@ full-attention improvement over plain HiF4 from `10.83%` to `71.72%` and causal
 improvement from `22.85%` to `66.89%`. Linear rank-32 raises the corresponding
 Linear proxy from `40.11%` to `41.82%`.
 
+On the fixed-seed random trend set calibrated from eleven measured online
+revisions, the current candidate scores `20818` locally versus `18872` for
+`3e93bd2`. Two independent, non-fitting seeds score `20784` and `20645` versus
+their respective baselines `18903` and `19217`. These are trend estimates, not
+promises of the contest-server score.
+
 The local-scale solver algebraically reduces eight hierarchy combinations to
 three effective total scales while preserving the original tie breaks. The
 earlier `d75e03a` revision measured `15300` points in `261 s`, and `5b922c8`
@@ -90,11 +107,11 @@ self-check time enough to fund covariance-aware Q/K and guarded V refinement.
 The later `237b142` Q+K Attention-Hessian experiment timed out on the contest
 server. Component ablation found that Q-only refinement provided essentially no
 gain, while K-only refinement slightly exceeded Q+K on the captured model. The
-best verified revision is `def4524` at `16775` points in `242 s`. The later
+best verified revision is `3e93bd2` at `18417` points in `232 s`. The earlier
 cross-validated alpha/K candidate `e0a19b0` regressed to `16700` points in
-`250 s` despite improving all local proxy groups, so the implementation has
-been restored to the `def4524` numerical path. The contest server remains the
-only authoritative source for score and runtime ordering.
+`250 s` despite improving all local proxy groups, so that experiment was
+restored before the later verified components were added. The contest server
+remains the only authoritative source for score and runtime ordering.
 
 ## Run the proxy benchmark
 
