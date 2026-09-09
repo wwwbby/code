@@ -272,21 +272,21 @@
   "candidate_scores": {
     "worktree": {
       "metrics": {
-        "linear_random": 0.2408921434809132,
+        "linear_random": 0.22337582421548535,
         "linear_public": 0.8243283313718355,
         "linear_qwen": 0.46044294219135873,
-        "attn_random_full": 0.30310379559576095,
-        "attn_random_causal": 0.2515863362473577,
-        "attn_random": 0.27734506592155933,
-        "attn_public_full": 0.37583517910447856,
-        "attn_public_causal": 0.3754334547353848,
-        "attn_public": 0.37563431691993165,
-        "attn_qwen_full": 0.9401876601471636,
-        "attn_qwen_causal": 0.9170936412457604,
-        "attn_qwen": 0.928640650696462
+        "attn_random_full": 0.3003317849545186,
+        "attn_random_causal": 0.251984136669848,
+        "attn_random": 0.2761579608121833,
+        "attn_public_full": 0.3753708115836341,
+        "attn_public_causal": 0.3752394773048383,
+        "attn_public": 0.37530514444423624,
+        "attn_qwen_full": 0.9398064366776118,
+        "attn_qwen_causal": 0.9168122958175872,
+        "attn_qwen": 0.9283093662475994
       },
-      "trend_z": 2.610154222795773,
-      "illustrative_predicted_score": 19723.297934918883
+      "trend_z": 2.496018757436449,
+      "illustrative_predicted_score": 19613.45969816816
     }
   }
 }

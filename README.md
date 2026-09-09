@@ -53,7 +53,7 @@ local sweeps and accepts blocks with at least 10% covariance-loss reduction.
 This K-only design captures the useful part of the timed-out Q+K experiment
 without repeatedly factorizing Hessians or refining the much larger Q tensor.
 V starts from a mild, compressed diagonal importance derived from bounded
-full/causal attention statistics. Four nested 4/8/32-token error-exchange
+full/causal attention statistics. Four nested 4/8/16-token error-exchange
 updates and two inexpensive analytic full/causal prefix updates then adjust
 only legal mantissas while retaining the chosen scale hierarchy. The prefix
 blend remains length-decayed, so the stronger cap affects short sequences most.
@@ -63,9 +63,10 @@ with direct alternatives on small deterministic projections of the supplied
 calibration tensors. Linear requires a 2% aggregate improvement plus agreement
 on alternating calibration folds. A second Q/K selector can choose rich,
 direct, Hadamard-only, Smooth-only, or Smooth+Hadamard and requires a 5%
-end-to-end Attention improvement over the incumbent. A rejected rich Linear
-path receives activation-energy-weighted Weight codes and a quantized-opponent
-Activation correction instead of reverting all the way to plain MSE.
+end-to-end Attention improvement over the incumbent. It reuses the inner
+selector's rich/direct losses and materializes only the three new candidates,
+keeping the added calibration work bounded. A rejected rich Linear path keeps
+the original guarded direct converter.
 
 The paired Linear and Q/K transforms are algebraically cancelling, so they
 preserve the unquantized Linear output and attention logits exactly apart from
@@ -92,9 +93,9 @@ improvement from `22.85%` to `66.89%`. Linear rank-32 raises the corresponding
 Linear proxy from `40.11%` to `41.82%`.
 
 On the fixed-seed random trend set, the current candidate moves Attention from
-`0.26475` to `0.27735` and Linear from `0.22338` to `0.24089` relative to
+`0.26475` to `0.27616` while Linear remains `0.22338` relative to
 `c11d987`. After the measured `c11d987` result was added, the refitted affine
-proxy gives only an illustrative `19723`; importantly, it overpredicts the
+proxy gives only an illustrative `19613`; importantly, it overpredicts the
 known `c11d987` result by 938 points. The local score is therefore a rejection
 gate, not an online forecast.
 
@@ -112,12 +113,11 @@ gain, while K-only refinement slightly exceeded Q+K on the captured model. The
 best verified revision is `c11d987` at `18471` points in `236 s`. The earlier
 cross-validated alpha/K candidate `e0a19b0` regressed to `16700` points in
 `250 s` despite improving all local proxy groups, so that experiment was
-restored before the later verified components were added. On the complete
-public-data API run, two paired timings were `37.52/38.56 s` for `c11d987` and
-`40.23/39.92 s` for the current candidate, an average increase of 5.4%. A
-linear extrapolation from 236 seconds is about 249 seconds, below the 300-second
-cutoff but still subject to server variance. The contest server remains the
-only authoritative source for score and runtime ordering.
+restored before the later verified components were added. The corrected
+candidate completes the full public format check in `32.671 s` versus
+`32.569 s` for `c11d987` in the same environment, and all `22/22` checks pass.
+The measured local increase is only 0.31%; the contest server remains the only
+authoritative source for score and runtime ordering.
 
 ## Run the proxy benchmark
 

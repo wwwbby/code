@@ -2533,9 +2533,9 @@ def hif4_dynamic_quantize_k(k_quant, k_scale, kv_num_heads, head_dim, k_state):
 
 
 # V quantization with a calibration-derived, permutation-invariant token metric.
-# For each channel and 32-token segment, minimize
+# For each channel and 16-token segment, minimize
 # sum(error ** 2) + beta * sum(error) ** 2 using only legal mantissa changes.
-_V_TOKEN_GROUP = 32
+_V_TOKEN_GROUP = 16
 _V_TOKEN_COUPLING = 1.0
 _V_TOKEN_UPDATES = 4
 # A small, distribution-free blend toward the expected output error of an
@@ -3156,7 +3156,6 @@ def hif4_dynamic_quantize_k(
     k = _dequantize_nvfp4_fp32(k_quant, k_scale)
     return _quantize_hif4(k)
 
-
 # A small calibration-selected family of Q/K paths.  The original rich/direct
 # guard remains the incumbent; Hadamard-only and smooth-only paths are useful
 # on tensors where the paired Hessian transform is too specialized.  Every
@@ -3196,36 +3195,23 @@ def _qk_multi_targets(q, k, q_heads, kv_heads, head_dim, states, mode):
     return q_value, k_value
 
 
-def _qk_multi_quantized_pairs(pairs, raw, q_heads, kv_heads, head_dim, states):
-    candidates = [
-        (
-            _reconstruct_hif4_fp32(
-                _QK_MULTI_RICH_Q(
-                    *pairs["q"], q_heads, head_dim, states["q_state"]
-                ),
-                tuple(raw["q"].shape),
-            ),
-            _reconstruct_hif4_fp32(
-                _QK_MULTI_RICH_K(
-                    *pairs["k"], kv_heads, head_dim, states["k_state"]
-                ),
-                tuple(raw["k"].shape),
-            ),
-        )
-    ]
-    for mode in range(1, len(_QK_MULTI_MODE_NAMES)):
+def _qk_multi_quantized_pairs(raw, q_heads, kv_heads, head_dim, states):
+    # The inner rich/direct selector already evaluated modes 0 and 1 with the
+    # same sample and token budget.  Only materialize the three new modes.
+    candidates = {}
+    for mode in range(2, len(_QK_MULTI_MODE_NAMES)):
         target = _qk_multi_targets(
             raw["q"], raw["k"], q_heads, kv_heads, head_dim, states, mode
         )
         q_target, k_target = target
-        candidates.append((
+        candidates[mode] = (
             _reconstruct_hif4_fp32(
                 _quantize_hif4(q_target), tuple(q_target.shape)
             ),
             _reconstruct_hif4_fp32(
                 _quantize_hif4(k_target), tuple(k_target.shape)
             ),
-        ))
+        )
     return candidates
 
 
@@ -3241,7 +3227,9 @@ def hif4_calibration_attention(
     sample_positions = _selector_positions(
         len(calib_qkv_list), _QK_MULTI_SAMPLES, torch.device("cpu")
     ).tolist()
+    selector_loss = states["q_state"]["qk_selector_loss"]
     losses = torch.zeros(len(_QK_MULTI_MODE_NAMES), dtype=torch.float32)
+    losses[:2] = selector_loss.float().mean(dim=0)
     for sample_index in sample_positions:
         sample = calib_qkv_list[sample_index]
         length = int(sample["q"][0].shape[0])
@@ -3259,14 +3247,14 @@ def hif4_calibration_attention(
             name: _dequantize_nvfp4_fp32(*pairs[name]) for name in pairs
         }
         candidates = _qk_multi_quantized_pairs(
-            pairs, raw, q_num_heads, kv_num_heads, head_dim, states
+            raw, q_num_heads, kv_num_heads, head_dim, states
         )
         for causal in (False, True):
             reference = _selector_attention(
                 raw["q"], raw["k"], raw["v"],
                 q_num_heads, kv_num_heads, head_dim, causal,
             )
-            for mode, (candidate_q, candidate_k) in enumerate(candidates):
+            for mode, (candidate_q, candidate_k) in candidates.items():
                 output = _selector_attention(
                     candidate_q, candidate_k, raw["v"],
                     q_num_heads, kv_num_heads, head_dim, causal,
@@ -3274,7 +3262,7 @@ def hif4_calibration_attention(
                 losses[mode] += (
                     output - reference
                 ).square().mean().cpu()
-    losses /= max(len(sample_positions), 1)
+    losses[2:] /= max(len(sample_positions), 1)
     incumbent = (
         0 if bool(states["q_state"].get("use_transformed_qk", True)) else 1
     )
@@ -3340,72 +3328,3 @@ def hif4_dynamic_quantize_k(
     if mode in (2, 4):
         k = _apply_attention_hadamard(k, kv_num_heads, head_dim)
     return _quantize_hif4(k)
-
-
-# The guarded Linear selector can intentionally choose a direct path for
-# isotropic calibration tensors.  Give that fallback the same inexpensive
-# asymmetric weighting as the rich path: calibration Activation energy selects
-# Weight codes, then the stored quantized Weight supplies a block-local joint
-# correction for dynamic Activations.  This branch is isolated from the rich
-# transform and is only materialized when the existing selector rejects it.
-_LINEAR_DIRECT_BASE_CALIBRATION = hif4_calibration_and_quantize_weight
-_LINEAR_DIRECT_BASE_DYNAMIC = hif4_dynamic_quantize_activation
-
-
-def hif4_calibration_and_quantize_weight(
-    weight_quant,
-    weight_scale,
-    calib_activation_list,
-):
-    calibrated = _LINEAR_DIRECT_BASE_CALIBRATION(
-        weight_quant, weight_scale, calib_activation_list
-    )
-    state = calibrated["activation_state"]
-    if bool(state.get("use_correlated_path", True)):
-        return calibrated
-    weight = _dequantize_nvfp4_fp32(weight_quant, weight_scale)
-    activations = [
-        _dequantize_nvfp4_fp32(*pair) for pair in calib_activation_list
-    ]
-    activation_second = sum(
-        value.square().sum(dim=0) for value in activations
-    )
-    activation_second = activation_second / max(
-        sum(int(value.shape[0]) for value in activations), 1
-    )
-    activation_second = activation_second.clamp_min(1.0e-8)
-    weight_params = _quantize_hif4(weight, activation_second)
-    joint_gram, joint_cross = _linear_joint_statistics(weight, weight_params)
-    state["direct_error_weights"] = (
-        weight.square().sum(dim=0).clamp_min(1.0e-8).cpu().contiguous()
-    )
-    state["direct_joint_gram"] = joint_gram
-    state["direct_joint_cross"] = joint_cross
-    state["direct_weighted"] = True
-    calibrated["weight_params"] = weight_params
-    return calibrated
-
-
-def hif4_dynamic_quantize_activation(
-    activation_quant,
-    activation_scale,
-    activation_state,
-):
-    if bool(activation_state.get("use_correlated_path", True)):
-        return _LINEAR_DIRECT_BASE_DYNAMIC(
-            activation_quant, activation_scale, activation_state
-        )
-    if not bool(activation_state.get("direct_weighted", False)):
-        activation = _dequantize_nvfp4_fp32(activation_quant, activation_scale)
-        return _quantize_hif4_fast(activation)
-    activation = _dequantize_nvfp4_fp32(activation_quant, activation_scale)
-    error_weights = _state_tensor(
-        activation_state,
-        "direct_error_weights",
-        (int(activation.shape[-1]),),
-    )
-    params = _quantize_hif4(activation, error_weights)
-    direct_state = dict(activation_state)
-    direct_state["joint_gram"] = activation_state["direct_joint_gram"]
-    direct_state["joint_cross"] = activation_state["direct_joint_cross"]
-    return _refine_linear_activation_joint(activation, params, direct_state)

@@ -116,15 +116,15 @@ available from the hidden evaluator.
 
 ### Post-c11 black-box probe family
 
-The next candidate has four independent changes, each retained as a separate
-commit from the common `c11d987` parent before the full combination is judged:
+Four changes were first built as independent probes from the common
+`c11d987` parent:
 
 1. raise only the short-sequence analytic V-prefix cap from `0.025` to `0.2`;
 2. change only the outer V exchange group from 16 to 32 tokens;
 3. add only the calibration-selected Q/K family (rich, direct,
    Hadamard-only, Smooth-only, and Smooth+Hadamard);
 4. add only activation-weighted direct Linear fallback quantization;
-5. combine all four after their main effects are known.
+5. combine accepted effects only after their main effects are known.
 
 For a probe score `S_i` and baseline `B=18471`, `S_i-B` is the corresponding
 online main effect. The interaction of the full candidate is its gain minus
@@ -134,15 +134,27 @@ coupling, alternate Q/K transforms, and direct Linear cases. It is a much more
 sample-efficient form of online adaptation than tuning another synthetic
 score mapping.
 
-The combined worktree passes `22/22` format checks. Relative to `c11d987`, the
-random trend metrics move Attention `0.26475 -> 0.27735` and Linear
-`0.22338 -> 0.24089`. Public and captured-Qwen guards remain non-regressive;
-the six-profile robust Attention mean is `0.50232/0.39281` for full/causal.
-Two paired complete public API timings are `37.52/38.56 s` for the baseline and
-`40.23/39.92 s` for the combination, an average 5.4% increase. Scaling the
-measured 236-second server baseline gives an illustrative 249 seconds. The
-refitted local score is only `19723`, and its 938-point overprediction of the
-already-measured baseline is recorded explicitly rather than hidden.
+Audit then quarantined probes 2 and 4 from the main candidate. The 32-token V
+prototype applied a coefficient calibrated on 16-token groups and halved the
+update density. The direct Linear prototype replaced the algorithm after the
+existing selector had evaluated a different direct path, mishandled arbitrary
+prefix dimensions, and added about 11 seconds on an archived `8192x2048`
+Weight when activated. They remain useful online diagnostics but are not safe
+defaults.
+
+The corrected main worktree therefore contains only the stronger decayed
+V-prefix cap and Q/K multibranch selection. It reuses the inner rich/direct
+losses and computes only the three genuinely new Q/K alternatives. The full
+format check passes `22/22` in `32.67 s`. Relative to `c11d987`, random
+Attention moves `0.26475 -> 0.27616` and Linear remains `0.22338`. Public
+Attention is effectively flat (`0.37578 -> 0.37531`), while the six-profile
+robust mean moves `0.49933/0.39337 -> 0.49952/0.39541` and the worst case moves
+`0.19096 -> 0.19903`. The old frozen trend fit would place this candidate over
+21000, but the refit that includes the disappointing server result gives only
+an illustrative `19613`; neither value is treated as a server forecast. A
+same-environment full-check rerun measured `32.569 s` for `c11d987` and
+`32.671 s` for the candidate, only 0.31% slower. Scaling the measured 236-second
+server baseline would give about 237 seconds, with the usual server variance.
 
 ### Random exam-like trend dataset
 
