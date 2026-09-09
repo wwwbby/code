@@ -61,6 +61,7 @@ ONLINE_RESULTS = (
     ("768a670", 18178, 233, "measured"),
     ("8d88fbc", 18182, 230, "measured"),
     ("3e93bd2", 18417, 232, "measured"),
+    ("c11d987", 18471, 236, "measured"),
 )
 
 # Each exam-like profile receives an independent derived seed.  Extra legacy
@@ -470,7 +471,7 @@ def main() -> None:
     parser.add_argument("--revisions", nargs="+", default=[
         "d75e03a", "5b922c8", "a649209", "def4524", "3c40705",
         "988385e", "be6ffae", "fe4b879", "768a670", "8d88fbc",
-        "3e93bd2",
+        "3e93bd2", "c11d987",
     ])
     parser.add_argument("--attention-seeds", nargs="*", type=int, default=list(DEFAULT_ATTENTION_SEEDS))
     parser.add_argument("--linear-seeds", nargs="*", type=int, default=list(DEFAULT_LINEAR_SEEDS))

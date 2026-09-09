@@ -28,7 +28,8 @@ dataset and must not be used to predict the current leaderboard.
 | `8d88fbc` | 18182 | 230 s | previous baseline | Append fixed-scale K quotient-space refinement |
 | `0ff81b5` | not measured | not measured | submitted candidate | Asymmetric Dynamic Activation reconstruction against quantized Weight |
 | `06250ad` | not measured | not measured | submitted candidate | Token-level guard for asymmetric Dynamic Activation refinement |
-| `3e93bd2` | **18417** | **232 s** | **online baseline** | Record token-guarded asymmetric Activation candidate |
+| `3e93bd2` | 18417 | 232 s | previous baseline | Record token-guarded asymmetric Activation candidate |
+| `c11d987` | **18471** | **236 s** | **online baseline** | Calibration guards plus analytic V-prefix correction |
 
 The user reported `768a670` at 18178 points in 233 seconds.  Relative to the
 previous online baseline `fe4b879`, the bundled branch gains 503 points.  Its
@@ -104,6 +105,44 @@ that quantized-opponent reconstruction transfers, but its much larger local
 Linear improvement maps to modest server weight; further Linear coordinate
 sweeps or covariance sketches are therefore stopped.  The next candidate uses
 the remaining budget on V/Attention and remains isolated from Linear changes.
+
+The user then reported `c11d987` at 18471 points in 236 seconds. Its random
+trend estimate had been about 20000--20800 depending on the fitted snapshot,
+so the actual gain of only 54 points establishes that the synthetic affine
+score is no longer a usable point predictor. It remains useful only for
+rejecting broad regressions. All post-`c11d987` work must preserve separately
+submittable online probes; bundling unrelated local gains loses the only signal
+available from the hidden evaluator.
+
+### Post-c11 black-box probe family
+
+The next candidate has four independent changes, each retained as a separate
+commit from the common `c11d987` parent before the full combination is judged:
+
+1. raise only the short-sequence analytic V-prefix cap from `0.025` to `0.2`;
+2. change only the outer V exchange group from 16 to 32 tokens;
+3. add only the calibration-selected Q/K family (rich, direct,
+   Hadamard-only, Smooth-only, and Smooth+Hadamard);
+4. add only activation-weighted direct Linear fallback quantization;
+5. combine all four after their main effects are known.
+
+For a probe score `S_i` and baseline `B=18471`, `S_i-B` is the corresponding
+online main effect. The interaction of the full candidate is its gain minus
+the sum of those four effects. This cannot reconstruct the hidden tensors, but
+it identifies the score-weighted sensitivity to short-sequence V, wider token
+coupling, alternate Q/K transforms, and direct Linear cases. It is a much more
+sample-efficient form of online adaptation than tuning another synthetic
+score mapping.
+
+The combined worktree passes `22/22` format checks. Relative to `c11d987`, the
+random trend metrics move Attention `0.26475 -> 0.27735` and Linear
+`0.22338 -> 0.24089`. Public and captured-Qwen guards remain non-regressive;
+the six-profile robust Attention mean is `0.50232/0.39281` for full/causal.
+Two paired complete public API timings are `37.52/38.56 s` for the baseline and
+`40.23/39.92 s` for the combination, an average 5.4% increase. Scaling the
+measured 236-second server baseline gives an illustrative 249 seconds. The
+refitted local score is only `19723`, and its 938-point overprediction of the
+already-measured baseline is recorded explicitly rather than hidden.
 
 ### Random exam-like trend dataset
 
