@@ -2542,7 +2542,7 @@ _V_TOKEN_UPDATES = 4
 # equal mixture of full attention and uniform causal attention.  The inverse
 # length schedule keeps the long-sequence work conservative while retaining
 # the stronger prior on short sequences.
-_V_PREFIX_MAX_BLEND = 0.025
+_V_PREFIX_MAX_BLEND = 0.2
 _V_PREFIX_LENGTH_SCALE = 3.2
 _V_PREFIX_UPDATES = 2
 # Test-time quotient selection supersedes the slower calibration-time K guard.
